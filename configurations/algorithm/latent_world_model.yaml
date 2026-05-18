@@ -29,6 +29,13 @@ device: cuda
 noise_level: log_normal
 val_render: True
 
+# Comprehensive training-side image metrics. Every N steps, render xs_pred via
+# render_img_cm on the current training batch and compute the same image metrics
+# that validation computes (mse/ssim/psnr/uiqi/fvd). Same per-firing cost as a
+# validation step; default cadence matches val_every_n_step.
+compute_train_metrics_every_n_steps: ${experiment.validation.val_every_n_step}
+compute_train_image_metrics: True
+
 # diffusion-related
 scheduling_matrix: autoregressive
 uncertainty_scale: 1.0

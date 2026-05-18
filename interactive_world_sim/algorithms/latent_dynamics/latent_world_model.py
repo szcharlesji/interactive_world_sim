@@ -76,6 +76,16 @@ class LatentWorldModel(BasePytorchAlgo):
             cfg.last_frame_loss_only if "last_frame_loss_only" in cfg else False
         )
         self.robust_latent = cfg.robust_latent if "robust_latent" in cfg else False
+        self.compute_train_metrics_every_n_steps = (
+            cfg.compute_train_metrics_every_n_steps
+            if "compute_train_metrics_every_n_steps" in cfg
+            else 2000
+        )
+        self.compute_train_image_metrics = (
+            cfg.compute_train_image_metrics
+            if "compute_train_image_metrics" in cfg
+            else True
+        )
 
     def _build_model(self) -> None:
         # decoder
@@ -344,6 +354,84 @@ class LatentWorldModel(BasePytorchAlgo):
         xs_pred = rearrange(xs_pred[T_hist:], "t b c h w -> b t c h w")
         return xs_pred
 
+    def _should_compute_train_metrics(self) -> bool:
+        n = self.compute_train_metrics_every_n_steps
+        if n is None or n <= 0:
+            return False
+        return self.global_step > 0 and self.global_step % n == 0
+
+    @torch.no_grad()
+    def _rollout_dynamics_like_validation(
+        self, z_gt: torch.Tensor, action: torch.Tensor
+    ) -> torch.Tensor:
+        """Roll out the dynamics model the same way validation_step S2 does.
+
+        :param z_gt: encoder ground-truth latents, shape (B, T, C, H, W)
+        :param action: normalized actions, shape (B, T, A)
+        :return: predicted latent sequence, shape (B, T, C, H, W)
+        """
+        z_0 = z_gt[:, 0]
+        z_seq_ls = []
+        z_last = z_0.clone()
+        horizon = z_gt.shape[1]
+
+        for i in range(1, action.shape[1], horizon):
+            action_chunk = action[:, i : i + horizon]
+            init_action_size = action_chunk.shape[1]
+            if init_action_size < horizon:
+                action_chunk = F.pad(
+                    action_chunk,
+                    (0, 0, 0, horizon - action_chunk.shape[1]),
+                    mode="replicate",
+                )
+            z_seq = self.dynamics_forward(z_last[:, None], action_chunk)
+            z_seq = z_seq[:, :init_action_size]
+            z_seq_ls.append(z_seq)
+            z_last = z_seq[:, -1].clone()
+        z_seq = torch.cat(z_seq_ls, 1)
+        z_seq = torch.cat([z_0.unsqueeze(1), z_seq], 1)
+        return z_seq
+
+    @torch.no_grad()
+    def _compute_image_metrics_for_batch(
+        self,
+        xs_obs_unnorm: torch.Tensor,
+        z_for_render: torch.Tensor,
+        batch_size: int,
+    ) -> dict:
+        """Render xs_pred for a batch and compute the validation metric dict.
+
+        :param xs_obs_unnorm: raw observations concatenated across views,
+            shape (B, T, C, H, W), range [0, 1].
+        :param z_for_render: latents fed to render_img_cm, shape (B*T, C_lat, H_lat, W_lat).
+        :param batch_size: B (used for the einops rearrange).
+        :return: dict from get_validation_metrics_for_videos (mse/psnr/ssim/uiqi/fvd/...).
+        """
+        xs_pred = render_img_cm(
+            self,
+            z_for_render,
+            xs_obs_unnorm.shape[-1],
+            self.normalizer,
+            num_views=self.num_views,
+        )
+        xs_pred = rearrange(
+            xs_pred, "(b t) c h w -> t b c h w", b=batch_size
+        ).detach().cpu()
+        xs_t_first = rearrange(
+            xs_obs_unnorm, "b t c h w -> t b c h w"
+        ).detach().cpu()
+        if self.validation_lpips_model is not None:
+            self.validation_lpips_model.reset()
+        if self.validation_fid_model is not None:
+            self.validation_fid_model.reset()
+        return get_validation_metrics_for_videos(
+            xs_pred,
+            xs_t_first,
+            lpips_model=self.validation_lpips_model,
+            fid_model=self.validation_fid_model,
+            fvd_model=self.validation_fvd_model,
+        )
+
     def validation_step(
         self, batch: dict, batch_idx: int, namespace: str = "validation"
     ) -> STEP_OUTPUT:
@@ -368,30 +456,7 @@ class LatentWorldModel(BasePytorchAlgo):
             z_seq = z_gt
         elif self.training_stage in [2]:
             # compute predicted latent
-            z_0 = z_gt[:, 0]
-            z_seq_ls = []
-            z_last = z_0.clone()
-            horizon = z_gt.shape[1]
-
-            for i in range(1, action.shape[1], horizon):
-                action_chunk = action[:, i : i + horizon]  # (B, horizon, A)
-                init_action_size = action_chunk.shape[1]
-                if init_action_size < horizon:
-                    # pad the last action to match the horizon
-                    action_chunk = F.pad(
-                        action_chunk,
-                        (0, 0, 0, horizon - action_chunk.shape[1]),
-                        mode="replicate",
-                    )
-                z_seq = self.dynamics_forward(
-                    z_last[:, None],
-                    action_chunk,
-                )  # (B, T, latent_dim)
-                z_seq = z_seq[:, :init_action_size]
-                z_seq_ls.append(z_seq)
-                z_last = z_seq[:, -1].clone()
-            z_seq = torch.cat(z_seq_ls, 1)
-            z_seq = torch.cat([z_0.unsqueeze(1), z_seq], 1)  # (B, T, latent_dim)
+            z_seq = self._rollout_dynamics_like_validation(z_gt, action)
             val_loss = F.mse_loss(z_seq, z_gt, reduction="none")  # (B, T, latent_dim)
             if torch.isnan(val_loss).any():
                 print("NaN in val_loss")
@@ -505,6 +570,11 @@ class LatentWorldModel(BasePytorchAlgo):
         obs = obs.float()
         action = action.float()
 
+        B = obs.shape[0]
+        compute_now = (
+            self.compute_train_image_metrics and self._should_compute_train_metrics()
+        )
+
         xs = obs  # (B, T, C, H, W)
         xs = rearrange(xs, "b t c h w -> (b t) c h w")
 
@@ -582,6 +652,21 @@ class LatentWorldModel(BasePytorchAlgo):
                 loss = loss.mean()
 
             self.log("training/rec_loss", loss)
+
+            if compute_now:
+                xs_obs_unnorm = torch.cat(
+                    [batch["obs"][k] for k in self.obs_keys], dim=2
+                )
+                image_metrics = self._compute_image_metrics_for_batch(
+                    xs_obs_unnorm, z.detach(), B
+                )
+                self.log_dict(
+                    {f"training/{k}": v for k, v in image_metrics.items()},
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                )
+
             output_dict = {
                 "loss": loss,
             }
@@ -655,8 +740,29 @@ class LatentWorldModel(BasePytorchAlgo):
             output_dict["loss"] = loss
 
             self.log("training/loss", output_dict["loss"])
+            self.log("training/dyn_loss", output_dict["loss"])
             for key in output_dict.keys():
                 self.log(f"training/{key}", output_dict[key])
+
+            if compute_now:
+                z_gt_for_roll = rearrange(z.detach(), "t b c h w -> b t c h w")
+                action_btb = rearrange(action, "t b a -> b t a")
+                z_seq_pred = self._rollout_dynamics_like_validation(
+                    z_gt_for_roll, action_btb
+                )
+                z_seq_flat = rearrange(z_seq_pred, "b t c h w -> (b t) c h w")
+                xs_obs_unnorm = torch.cat(
+                    [batch["obs"][k] for k in self.obs_keys], dim=2
+                )
+                image_metrics = self._compute_image_metrics_for_batch(
+                    xs_obs_unnorm, z_seq_flat, B
+                )
+                self.log_dict(
+                    {f"training/{k}": v for k, v in image_metrics.items()},
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                )
         elif self.training_stage == 3:
             with torch.no_grad():
                 z = self.encoder_forward(xs)  # (B*T, C, H, W)
@@ -726,6 +832,21 @@ class LatentWorldModel(BasePytorchAlgo):
                 loss = loss.mean()
 
             self.log("training/rec_loss", loss)
+
+            if compute_now:
+                xs_obs_unnorm = torch.cat(
+                    [batch["obs"][k] for k in self.obs_keys], dim=2
+                )
+                image_metrics = self._compute_image_metrics_for_batch(
+                    xs_obs_unnorm, z.detach(), B
+                )
+                self.log_dict(
+                    {f"training/{k}": v for k, v in image_metrics.items()},
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                )
+
             output_dict = {
                 "loss": loss,
             }
@@ -775,6 +896,16 @@ class LatentWorldModel(BasePytorchAlgo):
             on_epoch=True,
             prog_bar=True,
         )
+
+        if self.training_stage in [1, 3]:
+            rec_loss_val = F.mse_loss(xs_pred.float(), xs.float())
+            self.log(
+                f"{namespace}/rec_loss",
+                rec_loss_val,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+            )
 
         self.validation_step_outputs.clear()
 
