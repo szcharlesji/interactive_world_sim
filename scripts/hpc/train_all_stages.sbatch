@@ -123,10 +123,10 @@ latest_ckpt() {
 }
 
 # Common flags injected into every stage:
-#   experiment.training.checkpointing.save_last=True  => guarantees last.ckpt for resume
-#   hydra.run.dir=<stage dir>                         => keeps each stage's outputs in its own folder
-#   experiment.training.log_every_n_steps=100         => match README cadence
-COMMON_HYDRA_FLAGS='experiment.training.checkpointing.save_last=True'
+#   +experiment.training.checkpointing.save_last=True  => guarantees last.ckpt for resume
+#     (uses Hydra '+' prefix because save_last isn't pre-declared in base_pytorch.yaml)
+#   hydra.run.dir=<stage dir>                          => keeps each stage's outputs in its own folder
+COMMON_HYDRA_FLAGS='+experiment.training.checkpointing.save_last=True'
 
 echo "================================================================"
 echo "[$(date)] Job $SLURM_JOB_ID on $(hostname)"
