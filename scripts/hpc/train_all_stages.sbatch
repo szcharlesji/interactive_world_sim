@@ -159,7 +159,7 @@ if [[ ! -f $S1_DONE ]]; then
     dataset.obs_keys=$OBS_KEYS \
     dataset.action_mode=$ACT_MODE \
     hydra.run.dir=$S1_DIR \
-    experiment.training.batch_size=4 \
+    experiment.training.batch_size=32 \
     experiment.training.max_steps=1000005 \
     experiment.training.log_every_n_steps=100 \
     experiment.training.checkpointing.every_n_train_steps=10000 \
@@ -207,7 +207,7 @@ if [[ ! -f $S2_DONE ]]; then
     dataset.obs_keys=$OBS_KEYS \
     dataset.action_mode=$ACT_MODE \
     hydra.run.dir=$S2_DIR \
-    experiment.training.batch_size=4 \
+    experiment.training.batch_size=32 \
     experiment.training.max_steps=1000005 \
     experiment.training.log_every_n_steps=100 \
     experiment.training.checkpointing.every_n_train_steps=10000 \
@@ -260,7 +260,7 @@ if [[ ! -f $S3_DONE ]]; then
     dataset.obs_keys=$OBS_KEYS \
     dataset.action_mode=$ACT_MODE \
     hydra.run.dir=$S3_DIR \
-    experiment.training.batch_size=16 \
+    experiment.training.batch_size=32 \
     experiment.training.max_steps=1000005 \
     experiment.training.log_every_n_steps=100 \
     experiment.training.checkpointing.every_n_train_steps=10000 \
