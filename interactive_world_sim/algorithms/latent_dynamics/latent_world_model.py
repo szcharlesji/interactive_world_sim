@@ -740,15 +740,20 @@ class LatentWorldModel(BasePytorchAlgo):
             output_dict["loss"] = loss
 
             self.log("training/loss", output_dict["loss"])
-            self.log("training/dyn_loss", output_dict["loss"])
-            for key in output_dict.keys():
-                self.log(f"training/{key}", output_dict[key])
 
             if compute_now:
                 z_gt_for_roll = rearrange(z.detach(), "t b c h w -> b t c h w")
                 action_btb = rearrange(action, "t b a -> b t a")
                 z_seq_pred = self._rollout_dynamics_like_validation(
                     z_gt_for_roll, action_btb
+                )
+                # Latent rollout MSE — same formula as validation/dyn_loss.
+                train_dyn_loss = F.mse_loss(z_seq_pred[:, 1:], z_gt_for_roll[:, 1:])
+                self.log(
+                    "training/dyn_loss",
+                    train_dyn_loss,
+                    on_step=True,
+                    on_epoch=False,
                 )
                 z_seq_flat = rearrange(z_seq_pred, "b t c h w -> (b t) c h w")
                 xs_obs_unnorm = torch.cat(
