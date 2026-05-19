@@ -137,13 +137,13 @@ apptainer exec --nv \
       dataset.obs_keys=$OBS_KEYS \
       dataset.action_mode=$ACT_MODE \
       hydra.run.dir=$S2_DIR \
-      experiment.training.batch_size=32 \
+      experiment.training.batch_size=64 \
       experiment.training.max_steps=1000005 \
       experiment.training.log_every_n_steps=100 \
       experiment.training.checkpointing.every_n_train_steps=10000 \
       experiment.training.data.num_workers=4 \
       experiment.validation.batch_size=2 \
-      experiment.validation.val_every_n_step=30000 \
+      experiment.validation.val_every_n_step=500 \
       experiment.validation.limit_batch=1.0 \
       experiment.validation.data.num_workers=4 \
       algorithm.latent_dim=512 \
