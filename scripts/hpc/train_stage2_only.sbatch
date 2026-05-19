@@ -63,12 +63,25 @@ else
   exit 1
 fi
 
-# Snapshot the ckpt so the still-running stage-1 job can keep updating
-# last.ckpt without affecting us.
-SNAPSHOT=$S2_DIR/_s1_seed_$(basename "$S1_CKPT")
+# Snapshot the ckpt + the matching .hydra/ config into a self-contained
+# subdir that mimics the run-dir layout (<dir>/checkpoints/<name>.ckpt next
+# to <dir>/.hydra/). latent_world_model.py:_build_model resolves the load_ae
+# config from `dirname(dirname(ckpt))/.hydra/config.yaml`, so this layout is
+# required. The original S1 .hydra/ dir is copied (not symlinked) so the
+# still-running stage-1 job can keep updating its own files without affecting
+# us.
+SNAPSHOT_DIR=$S2_DIR/_s1_seed
+SNAPSHOT=$SNAPSHOT_DIR/checkpoints/$(basename "$S1_CKPT")
 if [[ ! -f "$SNAPSHOT" ]]; then
   echo "[$(date)] snapshotting $S1_CKPT -> $SNAPSHOT"
+  mkdir -p "$SNAPSHOT_DIR/checkpoints"
   cp "$S1_CKPT" "$SNAPSHOT"
+  if [[ -d "$S1_DIR/.hydra" ]]; then
+    cp -r "$S1_DIR/.hydra" "$SNAPSHOT_DIR/.hydra"
+  else
+    echo "FATAL: expected $S1_DIR/.hydra/ to exist for load_ae config resolution"
+    exit 1
+  fi
 fi
 S1_CKPT="$SNAPSHOT"
 
