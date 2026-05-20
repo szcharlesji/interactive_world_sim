@@ -19,27 +19,33 @@
 # writes to outputs/<task>/stage_2/ which is disjoint from stage_1.
 #
 # Usage:
-#   sbatch scripts/hpc/train_stage2_only.sbatch [task] [data_split] [s1_ckpt]
+#   sbatch scripts/hpc/train_stage2_only.sbatch [task] [data_split] [s1_ckpt] [run_suffix]
 #     task       = pusht | single_grasp | bimanual_sweep | bimanual_rope   (default: pusht)
 #     data_split = mini | full                                              (default: full)
 #     s1_ckpt    = absolute path to a stage-1 .ckpt                         (default: newest in stage_1/checkpoints/)
+#     run_suffix = suffix to append to the stage_2 output dir + wandb name. Use this to run
+#                  a second stage-2 job in parallel without clobbering an in-flight one.
+#                  Empty suffix -> outputs/<task>/stage_2/.  Suffix "b" -> outputs/<task>/stage_2_b/.
 #
 # Examples:
 #   sbatch scripts/hpc/train_stage2_only.sbatch pusht
 #   sbatch scripts/hpc/train_stage2_only.sbatch pusht full /scratch/$USER/interactive_world_sim/outputs/pusht/stage_1/checkpoints/epoch=4-step=15000.ckpt
+#   # parallel second run, auto-pick latest S1 ckpt, separate output dir:
+#   sbatch -J iws-s2-b scripts/hpc/train_stage2_only.sbatch pusht full "" b
 
 set -euo pipefail
 
 TASK="${1:-pusht}"
 DATA_SPLIT="${2:-full}"
 S1_CKPT_ARG="${3:-}"
+RUN_SUFFIX="${4:-}"
 
 REPO=/scratch/$USER/interactive_world_sim
 OVERLAY=$SCRATCH/iws.ext3
 IMAGE=${CONTAINER_IMAGES_FOLDER}/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif
 
 S1_DIR=$REPO/outputs/$TASK/stage_1
-S2_DIR=$REPO/outputs/$TASK/stage_2
+S2_DIR=$REPO/outputs/$TASK/stage_2${RUN_SUFFIX:+_$RUN_SUFFIX}
 
 mkdir -p logs "$S2_DIR"
 
@@ -107,7 +113,7 @@ trap requeue_self USR1
 
 echo "================================================================"
 echo "[$(date)] Job $SLURM_JOB_ID on $(hostname)"
-echo "  task=$TASK  split=$DATA_SPLIT"
+echo "  task=$TASK  split=$DATA_SPLIT  suffix=${RUN_SUFFIX:-<none>}"
 echo "  S1 seed  : $S1_CKPT"
 echo "  S2 dir   : $S2_DIR"
 echo "  resume   : ${RESUME_FLAG:-<none>}"
@@ -128,7 +134,7 @@ apptainer exec --nv \
     export TOKENIZERS_PARALLELISM=false
     export WANDB_API_KEY=\$(cat ~/.secrets/wandb_api_key 2>/dev/null || echo '')
 
-    python main.py +name=${TASK}_stage_2 \
+    python main.py +name=${TASK}_stage_2${RUN_SUFFIX:+_$RUN_SUFFIX} \
       algorithm=latent_world_model \
       experiment=exp_latent_dyn \
       dataset=real_aloha_dataset \
