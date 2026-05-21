@@ -270,10 +270,20 @@ class BaseLightningExperiment(BaseExperiment):
         val_dataloader = self._build_validation_loader()
         if hasattr(self.algo, "set_normalizer"):
             self.algo.set_normalizer(val_dataloader.dataset.get_normalizer())  # type: ignore
+        # Load weights ourselves rather than via trainer.validate(ckpt_path=...).
+        # Lightning's restore path uses torch.load's PyTorch-2.6 default
+        # weights_only=True, which rejects the OmegaConf objects stored in the
+        # checkpoint hyperparameters. Local checkpoints are trusted, so load with
+        # weights_only=False (mirroring LatentWorldModel's own load_ae path). This
+        # runs after set_normalizer so the checkpoint's normalizer buffers win.
+        if self.ckpt_path:
+            ckpt = torch.load(
+                self.ckpt_path, map_location="cpu", weights_only=False
+            )
+            self.algo.load_state_dict(ckpt["state_dict"])
         trainer.validate(
             self.algo,
             dataloaders=val_dataloader,
-            ckpt_path=self.ckpt_path,
         )
 
     def test(self) -> None:
