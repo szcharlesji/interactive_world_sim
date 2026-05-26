@@ -53,7 +53,7 @@ case "$TASK" in
   pusht)          OBS_KEYS='[camera_1_color]'; ACT_MODE=bimanual_push; ACT_DIM=4 ;;
   single_grasp)   OBS_KEYS='[camera_0_color]'; ACT_MODE=single_arm;    ACT_DIM=7 ;;
   bimanual_sweep) OBS_KEYS='[camera_0_color]'; ACT_MODE=bimanual_push; ACT_DIM=4 ;;
-  bimanual_rope)  OBS_KEYS='[camera_0_color]'; ACT_MODE=bimanual_3d;   ACT_DIM=6 ;;
+  bimanual_rope)  OBS_KEYS='[camera_0_color]'; ACT_MODE=bimanual_rope;  ACT_DIM=8 ;;
   *) echo "unknown task: $TASK"; exit 2 ;;
 esac
 
