@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 import numpy as np
+from gym_aloha.planar_objects import PlanarObjectSpec
 
 from .trajectory_primitives import (
     BimanualCoordination,
@@ -27,6 +28,16 @@ class TShapeInfo:
     height: float  # height of T stem
     thickness: float  # thickness of T
     pose: np.ndarray  # world_t_obj
+
+
+@dataclass
+class PlanarObjectInfo:
+    """Shape-generic planar object pose and geometry spec."""
+
+    center: np.ndarray
+    rotation: float
+    pose: np.ndarray
+    spec: PlanarObjectSpec
 
 
 @dataclass
@@ -490,8 +501,248 @@ class TGeometryAnalyzer:
             raise ValueError(f"Unknown rotation direction: {rotation_direction}")
 
 
+class PlanarObjectGeometryAnalyzer:
+    """Shape-generic planar object geometry analyzer.
+
+    Contact points are sampled from the perimeter of each box part in the
+    object's compound block-letter spec.  The public methods intentionally match
+    `TGeometryAnalyzer` so the existing `MotionPlanner` can operate on either.
+    """
+
+    def __init__(self, object_info: PlanarObjectInfo):
+        self.t_info = object_info
+        self.object_info = object_info
+        self._compute_contact_regions()
+
+    def _transform_local_points(self, points: np.ndarray) -> np.ndarray:
+        cos_r, sin_r = (
+            np.cos(self.object_info.rotation),
+            np.sin(self.object_info.rotation),
+        )
+        rot = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+        return self.object_info.center[None] + points @ rot.T
+
+    def _compute_contact_regions(self) -> None:
+        contact_points = []
+        for part in self.object_info.spec.parts:
+            hx, hy = part.size[:2]
+            corners = np.array(
+                [
+                    [-hx, -hy],
+                    [hx, -hy],
+                    [hx, hy],
+                    [-hx, hy],
+                ]
+            )
+            part_cos, part_sin = np.cos(part.yaw), np.sin(part.yaw)
+            part_rot = np.array([[part_cos, -part_sin], [part_sin, part_cos]])
+            corners = np.array(part.pos[:2])[None] + corners @ part_rot.T
+            for i in range(len(corners)):
+                start = corners[i]
+                end = corners[(i + 1) % len(corners)]
+                side_len = max(np.linalg.norm(end - start), 1e-8)
+                n = max(int(side_len / 0.004), 2)
+                weights = np.linspace(0.0, 1.0, n, endpoint=False)
+                contact_points.append(
+                    start[None] + weights[:, None] * (end - start)[None]
+                )
+        local_contact_points = np.concatenate(contact_points, axis=0)
+        self.all_contact_points = self._transform_local_points(local_contact_points)
+        self.contact_points = self._filter_exterior_contact_points(
+            self.all_contact_points
+        )
+
+    def _filter_exterior_contact_points(self, points: np.ndarray) -> np.ndarray:
+        """Keep mostly exterior contacts to avoid planning into letter holes.
+
+        Compound letters such as H/A/O have internal gaps where a two-finger
+        gripper can hook the object.  For scripted data collection we prefer
+        stable outer pushes, so random/contact planners sample from points near
+        the outer envelope rather than every internal bar edge.
+        """
+        if len(points) <= 8:
+            return points
+        center = self.object_info.center
+        radius = np.linalg.norm(points - center[None], axis=1)
+        radial_threshold = np.quantile(radius, 0.60)
+        x_min, y_min = points.min(axis=0)
+        x_max, y_max = points.max(axis=0)
+        bbox_margin = 0.018
+        exterior_mask = (
+            (radius >= radial_threshold)
+            | (points[:, 0] <= x_min + bbox_margin)
+            | (points[:, 0] >= x_max - bbox_margin)
+            | (points[:, 1] <= y_min + bbox_margin)
+            | (points[:, 1] >= y_max - bbox_margin)
+        )
+        exterior_points = points[exterior_mask]
+        return exterior_points if len(exterior_points) >= 8 else points
+
+    def select_contact_point(self, side: str) -> np.ndarray:
+        if side not in ["left", "right", "up", "down"]:
+            raise ValueError(
+                f"Side must be 'left', 'right', 'up', or 'down', got '{side}'"
+            )
+        all_points = self.contact_points.reshape(-1, 2)
+        if len(all_points) == 0:
+            return np.array([]).reshape(0, 2)
+        tolerance = 0.004
+        if side in ["left", "right"]:
+            return self._select_by_x_coordinate(all_points, side, tolerance)
+        return self._select_by_y_coordinate(all_points, side, tolerance)
+
+    def _select_by_x_coordinate(
+        self, all_points: np.ndarray, side: str, tolerance: float
+    ) -> np.ndarray:
+        sorted_points = all_points[np.argsort(all_points[:, 1])]
+        selected_points = []
+        current_y_group = []
+        current_y_ref = None
+        for point in sorted_points:
+            _, y = point
+            if current_y_ref is None or abs(y - current_y_ref) <= tolerance:
+                current_y_group.append(point)
+                current_y_ref = y if current_y_ref is None else current_y_ref
+            else:
+                selected_points.append(
+                    self._select_point_from_group_by_x(current_y_group, side)
+                )
+                current_y_group = [point]
+                current_y_ref = y
+        if current_y_group:
+            selected_points.append(
+                self._select_point_from_group_by_x(current_y_group, side)
+            )
+        return (
+            np.array(selected_points) if selected_points else np.array([]).reshape(0, 2)
+        )
+
+    def _select_by_y_coordinate(
+        self, all_points: np.ndarray, side: str, tolerance: float
+    ) -> np.ndarray:
+        sorted_points = all_points[np.argsort(all_points[:, 0])]
+        selected_points = []
+        current_x_group = []
+        current_x_ref = None
+        for point in sorted_points:
+            x, _ = point
+            if current_x_ref is None or abs(x - current_x_ref) <= tolerance:
+                current_x_group.append(point)
+                current_x_ref = x if current_x_ref is None else current_x_ref
+            else:
+                selected_points.append(
+                    self._select_point_from_group_by_y(current_x_group, side)
+                )
+                current_x_group = [point]
+                current_x_ref = x
+        if current_x_group:
+            selected_points.append(
+                self._select_point_from_group_by_y(current_x_group, side)
+            )
+        return (
+            np.array(selected_points) if selected_points else np.array([]).reshape(0, 2)
+        )
+
+    def _select_point_from_group_by_x(
+        self, points: List[np.ndarray], side: str
+    ) -> np.ndarray:
+        points_array = np.array(points)
+        return points_array[
+            np.argmin(points_array[:, 0])
+            if side == "left"
+            else np.argmax(points_array[:, 0])
+        ]
+
+    def _select_point_from_group_by_y(
+        self, points: List[np.ndarray], side: str
+    ) -> np.ndarray:
+        points_array = np.array(points)
+        return points_array[
+            np.argmax(points_array[:, 1])
+            if side == "up"
+            else np.argmin(points_array[:, 1])
+        ]
+
+    def get_linear_push_waypoints(
+        self, push_direction: str
+    ) -> Dict[str, List[np.ndarray]]:
+        push_distance = 0.12
+        approach_distance = 0.06
+        direction_cfg = {
+            "horizontal_right": ("left", np.array([1.0, 0.0]), "left"),
+            "horizontal_left": ("right", np.array([-1.0, 0.0]), "right"),
+            "vertical_up": ("down", np.array([0.0, 1.0]), "both"),
+            "vertical_down": ("up", np.array([0.0, -1.0]), "both"),
+        }
+        if push_direction not in direction_cfg:
+            raise ValueError(f"Unknown push direction: {push_direction}")
+        contact_side, push_dir, arm_mode = direction_cfg[push_direction]
+        contacts = self.select_contact_point(contact_side)
+        if len(contacts) == 0:
+            contacts = self.contact_points
+        if arm_mode == "both":
+            if len(contacts) >= 2:
+                chosen = contacts[np.random.choice(len(contacts), 2, replace=False)]
+                left_contact = chosen[chosen[:, 0].argmin()]
+                right_contact = chosen[chosen[:, 0].argmax()]
+            else:
+                left_contact = contacts[0] + np.array([-0.02, 0.0])
+                right_contact = contacts[0] + np.array([0.02, 0.0])
+            return {
+                "left": [
+                    left_contact - push_dir * approach_distance,
+                    left_contact,
+                    left_contact + push_dir * push_distance,
+                ],
+                "right": [
+                    right_contact - push_dir * approach_distance,
+                    right_contact,
+                    right_contact + push_dir * push_distance,
+                ],
+            }
+        contact = contacts[np.random.choice(len(contacts))]
+        waypoints = [
+            contact - push_dir * approach_distance,
+            contact,
+            contact + push_dir * push_distance,
+        ]
+        return {
+            "left": waypoints if arm_mode == "left" else [],
+            "right": waypoints if arm_mode == "right" else [],
+        }
+
+    def get_rotation_waypoints(
+        self, rotation_direction: str
+    ) -> Dict[str, List[np.ndarray]]:
+        if rotation_direction not in ["clockwise", "counterclockwise"]:
+            raise ValueError(f"Unknown rotation direction: {rotation_direction}")
+        points = self.contact_points
+        center = self.object_info.center
+        left_grip = points[np.argmin(points[:, 0])]
+        right_grip = points[np.argmax(points[:, 0])]
+        angle = -np.pi / 6 if rotation_direction == "clockwise" else np.pi / 6
+        cos_r, sin_r = np.cos(angle), np.sin(angle)
+        rot = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+        left_rotated = center + rot @ (left_grip - center)
+        right_rotated = center + rot @ (right_grip - center)
+        left_approach = (
+            left_grip
+            + (left_grip - center) / (np.linalg.norm(left_grip - center) + 1e-8) * 0.05
+        )
+        right_approach = (
+            right_grip
+            + (right_grip - center)
+            / (np.linalg.norm(right_grip - center) + 1e-8)
+            * 0.05
+        )
+        return {
+            "left": [left_approach, left_grip, left_rotated],
+            "right": [right_approach, right_grip, right_rotated],
+        }
+
+
 class CollisionChecker:
-    """Checks for collisions between arms and with T-shape."""
+    """Checks for collisions between arms and with a pushed planar object."""
 
     def __init__(
         self, t_analyzer: TGeometryAnalyzer, constraints: WorkspaceConstraints
@@ -853,8 +1104,13 @@ class MotionPlanner:
         Returns:
             trajectory: Nx4 array of bimanual trajectory
         """
-        # Initialize analyzers
-        t_analyzer = TGeometryAnalyzer(t_info)
+        # Initialize analyzers. Keep the original T-specific path for legacy
+        # mesh PushT data, and use the procedural object analyzer for generic
+        # block-letter shapes.
+        if isinstance(t_info, PlanarObjectInfo):
+            t_analyzer = PlanarObjectGeometryAnalyzer(t_info)
+        else:
+            t_analyzer = TGeometryAnalyzer(t_info)
         collision_checker = CollisionChecker(t_analyzer, self.constraints)
 
         # Generate trajectory based on motion type
@@ -1117,7 +1373,6 @@ class MotionPlanner:
                     current_pos[2:], right_target, allow_contact=False
                 )
             ):
-
                 # Create linear primitives
                 left_primitive = LinearPrimitive(
                     current_pos[:2], left_target, self.config

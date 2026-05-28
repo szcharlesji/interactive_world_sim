@@ -329,6 +329,15 @@ python scripts/data_collection/sim_aloha_dataset_collection_scripted.py \
 
 Use `--headless` to run without visualization. Episodes are auto-saved; only successful ones are kept based on a task-specific success function.
 
+To collect procedural block-letter push data for shape generalization, add `--shape` (`A`-`Z`). If `--shape` is omitted, the script keeps using the legacy mesh PushT environment.
+```bash
+MUJOCO_GL=egl python scripts/data_collection/sim_aloha_dataset_collection_scripted.py \
+    --output_dir data/mujoco/letters/H/random_contact \
+    --motion_type random_contact \
+    --shape H \
+    --headless
+```
+
 The collected data is also available on [Hugging Face](https://huggingface.co/datasets/yixuan1999/interactive-world-sim-mujoco-data).
 
 ## 🌎 WM Data Collection on ALOHA

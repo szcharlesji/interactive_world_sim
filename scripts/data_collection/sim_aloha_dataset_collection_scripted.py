@@ -22,23 +22,31 @@ import time
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from typing import Optional
+
 import click
 import cv2
 import numpy as np
 import transforms3d
 from gym_aloha.env import AlohaEnv
+from gym_aloha.planar_objects import get_planar_object_spec
+from yixuan_utilities.draw_utils import center_crop
 from yixuan_utilities.hdf5_utils import save_dict_to_hdf5
 from yixuan_utilities.kinematics_helper import KinHelper
-from yixuan_utilities.draw_utils import center_crop
 
-from interactive_world_sim.utils.draw_utils import concat_img_h, concat_img_v, plot_single_3d_pos_traj
-from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
+from interactive_world_sim.utils.draw_utils import (
+    concat_img_h,
+    concat_img_v,
+    plot_single_3d_pos_traj,
+)
 from interactive_world_sim.utils.motion_planner import (
     MotionPlanner,
+    PlanarObjectGeometryAnalyzer,
+    PlanarObjectInfo,
+    TGeometryAnalyzer,
     TShapeInfo,
     WorkspaceConstraints,
-    TGeometryAnalyzer,
 )
+from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
 
 
 def env_state_to_mat(env_state: np.ndarray) -> np.ndarray:
@@ -50,6 +58,19 @@ def env_state_to_mat(env_state: np.ndarray) -> np.ndarray:
     world_t_obj[:3, :3] = rot_matrix
     world_t_obj[:3, 3] = position
     return world_t_obj
+
+
+def is_planar_object_pose_valid(
+    env_state: np.ndarray,
+    min_flat_alignment: float = 0.97,
+    max_z: float = 0.06,
+) -> bool:
+    """Return whether the pushed object is still flat and on the table."""
+    world_t_obj = env_state_to_mat(env_state)
+    z_axis = world_t_obj[:3, 2]
+    alignment = float(np.dot(z_axis, np.array([0.0, 0.0, 1.0])))
+    z = float(world_t_obj[2, 3])
+    return alignment >= min_flat_alignment and z <= max_z
 
 
 def extract_t_info(env_state: np.ndarray) -> TShapeInfo:
@@ -103,6 +124,20 @@ def extract_t_info(env_state: np.ndarray) -> TShapeInfo:
         height=height,
         thickness=thickness,
         pose=world_t_obj,
+    )
+
+
+def extract_planar_object_info(env_state: np.ndarray, shape: str) -> PlanarObjectInfo:
+    """Extract generic planar object pose information from env state."""
+    world_t_obj = env_state_to_mat(env_state)
+    position = world_t_obj[:3, 3]
+    rot_matrix = world_t_obj[:3, :3]
+    rotation_angle = np.arctan2(rot_matrix[1, 0], rot_matrix[0, 0])
+    return PlanarObjectInfo(
+        center=position[:2],
+        rotation=rotation_angle,
+        pose=world_t_obj,
+        spec=get_planar_object_spec(shape),
     )
 
 
@@ -277,16 +312,22 @@ def save_episode(episode: dict, output_dir: str, episode_id: int) -> None:
     print(f"Episode {episode_id} saved!")
 
 
-def visualize_t_keypoints_on_camera(
-    img: np.ndarray, obs: dict, env: AlohaEnv, camera_name: str
+def visualize_object_keypoints_on_camera(
+    img: np.ndarray,
+    obs: dict,
+    env: AlohaEnv,
+    camera_name: str,
+    shape: Optional[str] = None,
 ) -> np.ndarray:
-    """Visualize T-shape 3D keypoints projected onto camera image."""
-    # Extract T-shape information
-    t_info = extract_t_info(obs["env_state"])
-    t_analyzer = TGeometryAnalyzer(t_info)
+    """Visualize planar object contact/key points projected onto camera image."""
+    if shape is None:
+        object_info = extract_t_info(obs["env_state"])
+        analyzer = TGeometryAnalyzer(object_info)
+    else:
+        object_info = extract_planar_object_info(obs["env_state"], shape)
+        analyzer = PlanarObjectGeometryAnalyzer(object_info)
 
-    # Get 3D keypoints from T-shape info (these are already in world coordinates)
-    keypoints_3d = t_analyzer.contact_points  # Shape: (N, 3)
+    keypoints_3d = analyzer.contact_points
     keypoints_3d = np.concatenate(
         [keypoints_3d, 0.02 * np.ones((keypoints_3d.shape[0], 1))], axis=-1
     )
@@ -322,6 +363,7 @@ def vis_obs(
     is_recording: bool,
     env: Optional[AlohaEnv] = None,
     trajectory: Optional[np.ndarray] = None,
+    shape: Optional[str] = None,
 ) -> np.ndarray:
     third_views = ["top_pov"]
 
@@ -331,7 +373,7 @@ def vis_obs(
 
         # Add T-shape keypoint visualization for top_pov camera
         if view_name == "top_pov" and env is not None:
-            img = visualize_t_keypoints_on_camera(img, obs, env, "top_pov")
+            img = visualize_object_keypoints_on_camera(img, obs, env, "top_pov", shape)
             if trajectory is not None:
                 trajectory = trajectory.reshape(-1, 2, 2)
                 trajectory = np.transpose(trajectory, (1, 0, 2))
@@ -441,6 +483,7 @@ def task_reset(
     acc_lim: float,
     vel_lim: float,
     headless: bool,
+    shape: Optional[str] = None,
 ) -> None:
     env.reset(seed=int(time.time()))
     obs = env._env.task.get_observation(env._env.physics)
@@ -471,7 +514,7 @@ def task_reset(
         env.step(joint_actions)
         obs = env._env.task.get_observation(env._env.physics)
         if not headless:
-            vis_img = vis_obs(obs, episode_id, False, env)
+            vis_img = vis_obs(obs, episode_id, False, env, shape=shape)
             vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
             cv2.imshow("Aloha Dataset Collection", vis_img)
             cv2.waitKey(1)
@@ -482,9 +525,21 @@ def task_reset(
     "--output_dir", "-o", default=".", help="Directory to save demonstration dataset."
 )
 @click.option("--motion_type", "-mt", default="random_no_contact", help="Motion type.")
+@click.option(
+    "--shape",
+    "-s",
+    default=None,
+    help=(
+        "Optional procedural block-letter shape (A-Z). If omitted, uses the "
+        "legacy mesh PushT environment."
+    ),
+)
 @click.option("--headless", "-h", is_flag=True, help="Run in headless mode.")
 def main(
-    output_dir: str, motion_type: str = "random_no_contact", headless: bool = False
+    output_dir: str,
+    motion_type: str = "random_no_contact",
+    shape: Optional[str] = None,
+    headless: bool = False,
 ) -> None:
     frequency = 10.0
     dt = 1 / frequency
@@ -499,7 +554,8 @@ def main(
     k_p, k_v = 50, 10  # PD control
     acc_lim = 10.0
     vel_lim = 0.04
-    env = AlohaEnv("pusht")
+    shape = shape.upper() if shape else None
+    env = AlohaEnv("planar_push", shape=shape) if shape else AlohaEnv("pusht")
     cv2.setNumThreads(1)
 
     time.sleep(1.0)
@@ -513,7 +569,7 @@ def main(
     episode = init_episode()
 
     # sample to a random init action
-    task_reset(env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless)
+    task_reset(env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless, shape)
 
     # Initialize scripted policy components
     workspace_constraints = WorkspaceConstraints(
@@ -544,6 +600,29 @@ def main(
         # pump obs
         obs = env._env.task.get_observation(env._env.physics)  # noqa
 
+        if shape is not None and not is_planar_object_pose_valid(obs["env_state"]):
+            print(
+                f"Episode {episode_id} aborted: object tipped/lifted or got hooked. Resetting."
+            )
+            episode = init_episode()
+            task_reset(
+                env,
+                episode_id,
+                kin_helper,
+                k_p,
+                k_v,
+                acc_lim,
+                vel_lim,
+                headless,
+                shape,
+            )
+            is_recording = False
+            episode_start_time = None
+            current_trajectory = None
+            trajectory_step = 0
+            trial_num += 1
+            continue
+
         # Auto-recording logic
         if auto_record and not is_recording:
             is_recording = True
@@ -573,7 +652,15 @@ def main(
                 )
                 episode = init_episode()
                 task_reset(
-                    env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless
+                    env,
+                    episode_id,
+                    kin_helper,
+                    k_p,
+                    k_v,
+                    acc_lim,
+                    vel_lim,
+                    headless,
+                    shape,
                 )
                 is_recording = False
                 print(
@@ -582,7 +669,7 @@ def main(
                 episode_start_time = None
 
         # visualize
-        vis_img = vis_obs(obs, episode_id, is_recording, env, current_trajectory)
+        vis_img = vis_obs(obs, episode_id, is_recording, env, current_trajectory, shape)
         if not headless:
             vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
             cv2.imshow("Aloha Dataset Collection", vis_img)
@@ -597,12 +684,25 @@ def main(
             while not success:
                 episode = init_episode()
                 task_reset(
-                    env, episode_id, kin_helper, k_p, k_v, acc_lim, vel_lim, headless
+                    env,
+                    episode_id,
+                    kin_helper,
+                    k_p,
+                    k_v,
+                    acc_lim,
+                    vel_lim,
+                    headless,
+                    shape,
                 )
                 obs = env._env.task.get_observation(env._env.physics)
 
-                # Extract T-shape information
-                t_info = extract_t_info(obs["env_state"])
+                # Extract pushed-object information.  `shape is None` keeps the
+                # legacy mesh PushT geometry; any shape value uses the generic
+                # procedural block-letter geometry.
+                if shape is None:
+                    object_info = extract_t_info(obs["env_state"])
+                else:
+                    object_info = extract_planar_object_info(obs["env_state"], shape)
 
                 # Get current arm positions
                 current_arm_pos = get_current_arm_positions(
@@ -611,7 +711,9 @@ def main(
 
                 # Plan new trajectory
                 current_trajectory, success, success_fn, trajectory_steps = (
-                    motion_planner.plan_episode(t_info, current_arm_pos, motion_type)
+                    motion_planner.plan_episode(
+                        object_info, current_arm_pos, motion_type
+                    )
                 )
             trajectory_step = 0
 
