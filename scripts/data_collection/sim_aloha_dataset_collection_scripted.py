@@ -27,6 +27,7 @@ import click
 import cv2
 import numpy as np
 import transforms3d
+from gym_aloha.constants import PUPPET_GRIPPER_POSITION_OPEN
 from gym_aloha.env import AlohaEnv
 from gym_aloha.planar_objects import get_planar_object_spec
 from yixuan_utilities.draw_utils import center_crop
@@ -47,6 +48,20 @@ from interactive_world_sim.utils.motion_planner import (
     WorkspaceConstraints,
 )
 from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
+
+PLANAR_PUSH_EEF_Z = 0.014
+PLANAR_PUSH_GRIPPER = 1.0
+
+
+def freeze_planar_grippers_open(env: AlohaEnv) -> None:
+    """Force simulated gripper fingers to a fixed wide-open pusher state."""
+    physics = env._env.physics
+    physics.data.qpos[6:8] = PUPPET_GRIPPER_POSITION_OPEN
+    physics.data.qpos[14:16] = PUPPET_GRIPPER_POSITION_OPEN
+    if physics.data.ctrl.shape[0] >= 14:
+        physics.data.ctrl[6] = PUPPET_GRIPPER_POSITION_OPEN
+        physics.data.ctrl[13] = PUPPET_GRIPPER_POSITION_OPEN
+    physics.forward()
 
 
 def env_state_to_mat(env_state: np.ndarray) -> np.ndarray:
@@ -169,6 +184,34 @@ def get_current_arm_positions(
     return np.concatenate([left_xy, right_xy])
 
 
+def are_eefs_outside_object_footprint(
+    obs: dict,
+    shape: str,
+    kin_helper: KinHelper,
+    world_t_bases: np.ndarray,
+    inset: float = 0.004,
+) -> bool:
+    """Reject frames where an EEF center is inside the letter footprint.
+
+    Contact should happen from the side; if the EEF center enters the object's
+    XY footprint, the claw is likely visually overlapping, hooked, or passing
+    through a hole in the letter.
+    """
+    object_info = extract_planar_object_info(obs["env_state"], shape)
+    analyzer = PlanarObjectGeometryAnalyzer(object_info)
+    points = analyzer.all_contact_points
+    x_min, y_min = points.min(axis=0) + inset
+    x_max, y_max = points.max(axis=0) - inset
+    eef_xy = get_current_arm_positions(obs, kin_helper, world_t_bases).reshape(2, 2)
+    inside = (
+        (eef_xy[:, 0] > x_min)
+        & (eef_xy[:, 0] < x_max)
+        & (eef_xy[:, 1] > y_min)
+        & (eef_xy[:, 1] < y_max)
+    )
+    return not bool(inside.any())
+
+
 def trajectory_to_joint_actions(
     target_xy: np.ndarray,
     world_t_bases: np.ndarray,
@@ -190,7 +233,7 @@ def trajectory_to_joint_actions(
         # Target end-effector pose
         world_t_ee_pose = np.eye(4)
         world_t_ee_pose[:2, 3] = target_xy[rob_i * 2 : rob_i * 2 + 2]
-        world_t_ee_pose[2, 3] = 0.02
+        world_t_ee_pose[2, 3] = PLANAR_PUSH_EEF_Z
 
         theta = np.pi * 5.0 / 12.0
         target_ee_pose = np.linalg.inv(world_t_bases[rob_i]) @ world_t_ee_pose
@@ -203,7 +246,7 @@ def trajectory_to_joint_actions(
         )
         target_ee_pose[0, 3] = np.clip(target_ee_pose[0, 3], 0.25, 0.6)
         target_ee_pose[1, 3] = np.clip(target_ee_pose[1, 3], -0.2, 0.2)
-        target_ee_pose[2, 3] = 0.02
+        target_ee_pose[2, 3] = PLANAR_PUSH_EEF_Z
 
         world_t_ee_pose_clip = world_t_bases[rob_i] @ target_ee_pose
         target_xy_clip[rob_i * 2 : rob_i * 2 + 2] = world_t_ee_pose_clip[:2, 3]
@@ -230,10 +273,11 @@ def trajectory_to_joint_actions(
         pid_ee_pose[:3, 3] = curr_ee_pose[:3, 3] + avg_vel * dt
         curr_vel[rob_i * 3 : rob_i * 3 + 3] = next_vel
 
-        # Inverse kinematics
+        # Inverse kinematics. Use a fixed wide-open gripper so only XY
+        # position changes; openness never changes during planar pushing.
         ik_joint = kin_helper.compute_ik_from_mat(ik_init_joint, pid_ee_pose)
         puppet_target_state[7 * rob_i : 7 * rob_i + 6] = ik_joint[:6]
-        puppet_target_state[7 * rob_i + 6] = 0.0  # Gripper closed
+        puppet_target_state[7 * rob_i + 6] = PLANAR_PUSH_GRIPPER
 
     return puppet_target_state, target_xy_clip
 
@@ -458,7 +502,27 @@ def update_episode(
     return episode
 
 
-def generate_random_init_action(world_t_bases: np.ndarray) -> np.ndarray:
+def generate_random_init_action(
+    world_t_bases: np.ndarray,
+    obs: Optional[dict] = None,
+    shape: Optional[str] = None,
+) -> np.ndarray:
+    if shape is not None and obs is not None:
+        object_info = extract_planar_object_info(obs["env_state"], shape)
+        analyzer = PlanarObjectGeometryAnalyzer(object_info)
+        points = analyzer.all_contact_points
+        x_min, y_min = points.min(axis=0)
+        x_max, y_max = points.max(axis=0)
+        center_y = (y_min + y_max) / 2.0 + np.random.uniform(-0.02, 0.02)
+        clearance = 0.10
+        left_xy = np.array([x_min - clearance, center_y])
+        right_xy = np.array([x_max + clearance, center_y])
+        left_xy[0] = np.clip(left_xy[0], -0.25, 0.25)
+        right_xy[0] = np.clip(right_xy[0], -0.25, 0.25)
+        left_xy[1] = np.clip(left_xy[1], -0.2, 0.2)
+        right_xy[1] = np.clip(right_xy[1], -0.2, 0.2)
+        return np.concatenate([left_xy, right_xy])
+
     rand_init_action = np.random.uniform(0, 1, size=(4,))
     rand_init_action[0] = rand_init_action[0] * 0.2 + 0.05
     rand_init_action[1] = rand_init_action[1] * 0.4 - 0.2
@@ -486,13 +550,15 @@ def task_reset(
     shape: Optional[str] = None,
 ) -> None:
     env.reset(seed=int(time.time()))
+    if shape is not None:
+        freeze_planar_grippers_open(env)
     obs = env._env.task.get_observation(env._env.physics)
     left_base = obs["left_base"][None]
     right_base = obs["right_base"][None]
     left_base_mat = pose_convert(left_base, PoseType.POS_QUAT, PoseType.MAT)[0]
     right_base_mat = pose_convert(right_base, PoseType.POS_QUAT, PoseType.MAT)[0]
     world_t_bases = np.stack([left_base_mat, right_base_mat])
-    rand_init_action = generate_random_init_action(world_t_bases)
+    rand_init_action = generate_random_init_action(world_t_bases, obs, shape)
     curr_vel = np.zeros(6)
     curr_puppet_joint = obs["qpos"][:14]
     dt = 1 / 10.0
@@ -512,6 +578,8 @@ def task_reset(
             vel_lim,
         )
         env.step(joint_actions)
+        if shape is not None:
+            freeze_planar_grippers_open(env)
         obs = env._env.task.get_observation(env._env.physics)
         if not headless:
             vis_img = vis_obs(obs, episode_id, False, env, shape=shape)
@@ -600,9 +668,14 @@ def main(
         # pump obs
         obs = env._env.task.get_observation(env._env.physics)  # noqa
 
-        if shape is not None and not is_planar_object_pose_valid(obs["env_state"]):
+        if shape is not None and (
+            not is_planar_object_pose_valid(obs["env_state"])
+            or not are_eefs_outside_object_footprint(
+                obs, shape, kin_helper, world_t_bases
+            )
+        ):
             print(
-                f"Episode {episode_id} aborted: object tipped/lifted or got hooked. Resetting."
+                f"Episode {episode_id} aborted: object tipped/lifted or claw overlapped the letter. Resetting."
             )
             episode = init_episode()
             task_reset(
@@ -746,6 +819,8 @@ def main(
 
         # execute teleop command
         env.step(puppet_target_state)
+        if shape is not None:
+            freeze_planar_grippers_open(env)
         iter_idx += 1
 
     # exit contexts

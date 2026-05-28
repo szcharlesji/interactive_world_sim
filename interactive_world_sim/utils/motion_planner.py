@@ -13,6 +13,7 @@ from .trajectory_primitives import (
     BimanualCoordination,
     CurvePrimitive,
     LinearPrimitive,
+    StabilizePrimitive,
     TrajectoryConfig,
 )
 
@@ -1283,6 +1284,14 @@ class MotionPlanner:
         num_steps: int,
     ) -> tuple[np.ndarray, bool, callable]:
         """Plan random contact motion."""
+        if isinstance(t_analyzer, PlanarObjectGeometryAnalyzer):
+            return self._plan_random_contact_motion_planar_object(
+                t_analyzer,
+                current_pos,
+                duration,
+                num_steps,
+            )
+
         # Randomly select contact points
         left_contact = random.choice(t_analyzer.contact_points)
         right_contact = random.choice(t_analyzer.contact_points)
@@ -1332,6 +1341,58 @@ class MotionPlanner:
             ),
             True,
             success_fn,
+        )
+
+    def _plan_random_contact_motion_planar_object(
+        self,
+        t_analyzer: PlanarObjectGeometryAnalyzer,
+        current_pos: np.ndarray,
+        duration: float,
+        num_steps: int,
+    ) -> tuple[np.ndarray, bool, callable]:
+        """Plan a one-arm exterior side push for generic letters.
+
+        Two-arm random contact often traps letters between claws or hooks holes
+        in shapes like A/H/O.  For procedural letters, use one active side-push
+        while the other arm stabilizes away from the object.
+        """
+        use_left_arm = random.random() < 0.5
+        side = "left" if use_left_arm else "right"
+        contacts = t_analyzer.select_contact_point(side)
+        if len(contacts) == 0:
+            contacts = t_analyzer.contact_points
+        contact = contacts[np.random.choice(len(contacts))].copy()
+
+        approach_distance = 0.055
+        push_distance = 0.055
+        push_dir = np.array([1.0, 0.0]) if use_left_arm else np.array([-1.0, 0.0])
+        approach = contact - push_dir * approach_distance
+        pushed = contact + push_dir * push_distance
+
+        if use_left_arm:
+            active_waypoints = [current_pos[:2], approach, contact, pushed]
+            for waypoint in active_waypoints[1:]:
+                waypoint[0] -= self.eef_fingertip_offset
+            left_primitive = CurvePrimitive(active_waypoints, self.config)
+            right_primitive = StabilizePrimitive(current_pos[2:], self.config)
+        else:
+            active_waypoints = [current_pos[2:], approach, contact, pushed]
+            for waypoint in active_waypoints[1:]:
+                waypoint[0] += self.eef_fingertip_offset
+            left_primitive = StabilizePrimitive(current_pos[:2], self.config)
+            right_primitive = CurvePrimitive(active_waypoints, self.config)
+
+        return (
+            self.coordinator.coordinate(
+                left_primitive,
+                right_primitive,
+                duration,
+                num_steps,
+                "simultaneous",
+                speed_profile="constant",
+            ),
+            True,
+            evaluate_random_contact_success,
         )
 
     def _plan_random_no_contact_motion(

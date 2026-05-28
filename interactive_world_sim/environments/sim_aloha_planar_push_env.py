@@ -6,7 +6,7 @@ import torch
 import transforms3d
 from dm_control import mujoco
 from gym_aloha.constants import (
-    PUPPET_GRIPPER_JOINT_CLOSE,
+    PUPPET_GRIPPER_POSITION_OPEN,
     convert_puppet_from_joint_to_position,
 )
 from gym_aloha.env import AlohaEnv
@@ -20,6 +20,9 @@ from interactive_world_sim.utils.pose_utils import (
 )
 
 from .base_env import BaseEnv
+
+PLANAR_PUSH_EEF_Z = 0.014
+PLANAR_PUSH_GRIPPER = 1.0
 
 
 def pos_quat_to_mat(pose_in_pos_quat: np.ndarray) -> np.ndarray:
@@ -140,21 +143,32 @@ class SimAlohaPlanarPushEnv(BaseEnv):
                     [-np.cos(theta), 0.0, np.sin(theta)],
                 ]
             )
-            rob_t_pid_mat[2, 3] = 0.02
+            rob_t_pid_mat[2, 3] = PLANAR_PUSH_EEF_Z
 
             solved_joints[6 * i : 6 * i + 6] = self.kin_helper.compute_ik_from_mat(
                 init_qpos, rob_t_pid_mat
             )[:6]
 
         self.iter_num += 1
-        grippers = np.ones(1) * PUPPET_GRIPPER_JOINT_CLOSE
+        grippers = np.array([PLANAR_PUSH_GRIPPER, PLANAR_PUSH_GRIPPER])
         env_action = np.concatenate(
-            [solved_joints[:6], grippers, solved_joints[6:], grippers]
+            [solved_joints[:6], grippers[:1], solved_joints[6:], grippers[1:]]
         )
         self.last_qpos = np.concatenate(
-            [solved_joints[:6], np.zeros(2), solved_joints[6:], np.zeros(2)]
+            [solved_joints[:6], grippers[:1], solved_joints[6:], grippers[1:]]
         )
-        return self.env.step(env_action)
+        step_obs = self.env.step(env_action)
+        self._freeze_grippers_open()
+        return step_obs
+
+    def _freeze_grippers_open(self) -> None:
+        physics = self.env._env.physics
+        physics.data.qpos[6:8] = PUPPET_GRIPPER_POSITION_OPEN
+        physics.data.qpos[14:16] = PUPPET_GRIPPER_POSITION_OPEN
+        if physics.data.ctrl.shape[0] >= 14:
+            physics.data.ctrl[6] = PUPPET_GRIPPER_POSITION_OPEN
+            physics.data.ctrl[13] = PUPPET_GRIPPER_POSITION_OPEN
+        physics.forward()
 
     def render(self, mode: str = "human") -> dict:
         """Render the environment."""
@@ -198,6 +212,7 @@ class SimAlohaPlanarPushEnv(BaseEnv):
             self.env._env.physics.forward()  # noqa
         else:
             self.env.reset(seed=seed)
+        self._freeze_grippers_open()
         self.iter_num = 0
         self.last_xy = np.zeros(4)
         self.curr_vel = np.zeros(4)
