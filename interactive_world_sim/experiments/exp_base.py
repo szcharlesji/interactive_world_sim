@@ -239,6 +239,7 @@ class BaseLightningExperiment(BaseExperiment):
             train_dataloaders=train_dataloader,
             val_dataloaders=val_dataloader,
             ckpt_path=self.ckpt_path,
+            weights_only=False,
         )
 
     def validation(self) -> None:
@@ -277,9 +278,7 @@ class BaseLightningExperiment(BaseExperiment):
         # weights_only=False (mirroring LatentWorldModel's own load_ae path). This
         # runs after set_normalizer so the checkpoint's normalizer buffers win.
         if self.ckpt_path:
-            ckpt = torch.load(
-                self.ckpt_path, map_location="cpu", weights_only=False
-            )
+            ckpt = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
             self.algo.load_state_dict(ckpt["state_dict"])
         trainer.validate(
             self.algo,
