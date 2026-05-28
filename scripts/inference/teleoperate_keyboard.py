@@ -13,8 +13,12 @@ from omegaconf import DictConfig, OmegaConf
 from yixuan_utilities.draw_utils import center_crop
 from yixuan_utilities.hdf5_utils import load_dict_from_hdf5, save_dict_to_hdf5
 from yixuan_utilities.joystick_utils import Joystick
-from yixuan_utilities.keyboard_utils import KeyReader
 from yixuan_utilities.kinematics_helper import KinHelper
+
+try:
+    from yixuan_utilities.keyboard_utils import KeyReader
+except Exception:
+    KeyReader = None
 
 from interactive_world_sim.algorithms.common.diffusion_helper import render_img_cm
 from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import (
@@ -117,7 +121,17 @@ def read_joystick(ctrl: Joystick) -> np.ndarray:
         return np.array([x_l, y_l, x_r, y_r]), np.array([lb, rb, B])
 
 
-def read_keyboard(ctrl: KeyReader, scene: str) -> np.ndarray:
+class Cv2KeyReader:
+    """Keyboard reader that uses OpenCV window events instead of pynput/X RECORD."""
+
+    def read(self) -> set[str]:
+        key = cv2.waitKey(1) & 0xFF
+        if key == 255:
+            return set()
+        return {chr(key)}
+
+
+def read_keyboard(ctrl, scene: str) -> np.ndarray:
     keys = ctrl.read()
     signal = np.zeros(3)
     if scene in [
@@ -414,7 +428,8 @@ def record_one_episode(
         2,
     )
     cv2.imshow("pred", concat_img)
-    cv2.waitKey(100)
+    if not isinstance(controller, Cv2KeyReader):
+        cv2.waitKey(100)
 
     out_vid = cv2.VideoWriter(
         f"{output_dir}/out_vid/{episode_id}.mp4",
@@ -584,7 +599,8 @@ def record_one_episode(
             2,
         )
         cv2.imshow("pred", concat_img)
-        cv2.waitKey(1)
+        if not isinstance(controller, Cv2KeyReader):
+            cv2.waitKey(1)
 
         step_i += 1
         print("freq:", 1 / (time.time() - start_time))
@@ -651,12 +667,12 @@ def main(cfg: DictConfig) -> None:
         total_params = sum(p.numel() for p in model.parameters())
         param_size_mb = total_params * 4 / (1024**2)  # Assuming float32
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Model Size Statistics:")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Total parameters: {total_params / 1e6} M parameters")
         print(f"Estimated size (float32): {param_size_mb:.2f} MB")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
     # set up env
     dt = 1 / 30.0
@@ -665,7 +681,14 @@ def main(cfg: DictConfig) -> None:
         controller = Joystick()
     elif cfg.use_dataset:
         pass
+    elif cfg.get("keyboard_backend", "cv2") == "cv2":
+        controller = Cv2KeyReader()
     else:
+        if KeyReader is None:
+            raise RuntimeError(
+                "pynput keyboard backend is unavailable. Use "
+                "+keyboard_backend=cv2 to use OpenCV key events instead."
+            )
         controller = KeyReader()
     # episqode_id = len(list(Path(output_dir).glob("episode_*.hdf5")))
     # episode_id = 28
