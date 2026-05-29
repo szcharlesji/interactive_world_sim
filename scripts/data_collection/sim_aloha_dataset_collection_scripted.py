@@ -46,6 +46,8 @@ from interactive_world_sim.utils.motion_planner import (
     TGeometryAnalyzer,
     TShapeInfo,
     WorkspaceConstraints,
+    evaluate_random_contact_success,
+    evaluate_random_motion_success,
 )
 from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
 
@@ -54,6 +56,34 @@ from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
 # letter on the sloped lower part of the open claws.
 PLANAR_PUSH_EEF_Z = 0.022
 PLANAR_PUSH_GRIPPER = 1.0
+DEFAULT_EPISODE_STEPS = 600
+DEFAULT_MOTION_SPEEDUP = 5.0
+
+
+def speed_up_trajectory(trajectory: np.ndarray, speedup: float) -> np.ndarray:
+    """Resample a planned XY trajectory to make each executed step larger."""
+    if speedup <= 1.0 or len(trajectory) <= 2:
+        return trajectory
+    num_steps = max(2, int(np.ceil(len(trajectory) / speedup)))
+    indices = np.rint(np.linspace(0, len(trajectory) - 1, num_steps)).astype(int)
+    return trajectory[indices]
+
+
+def evaluate_collection_success(
+    motion_type: str,
+    init_pose: np.ndarray,
+    final_pose: np.ndarray,
+    actions: np.ndarray,
+) -> bool:
+    """Evaluate a full multi-segment collection episode.
+
+    Individual planned segments may choose different push directions.  For full
+    episodes with multiple segments, use direction-agnostic movement success for
+    contact motions and no-movement success for random_no_contact.
+    """
+    if motion_type == "random_no_contact":
+        return evaluate_random_motion_success(init_pose, final_pose, actions)
+    return evaluate_random_contact_success(init_pose, final_pose, actions)
 
 
 def freeze_planar_grippers_open(env: AlohaEnv) -> None:
@@ -762,12 +792,33 @@ def task_reset(
     ),
 )
 @click.option("--headless", "-h", is_flag=True, help="Run in headless mode.")
+@click.option(
+    "--episode_steps",
+    default=DEFAULT_EPISODE_STEPS,
+    type=int,
+    show_default=True,
+    help="Number of recorded frames per saved episode/video.",
+)
+@click.option(
+    "--motion_speedup",
+    default=DEFAULT_MOTION_SPEEDUP,
+    type=float,
+    show_default=True,
+    help="Resample each planned motion segment by this factor before execution.",
+)
 def main(
     output_dir: str,
     motion_type: str = "random_no_contact",
     shape: Optional[str] = None,
     headless: bool = False,
+    episode_steps: int = DEFAULT_EPISODE_STEPS,
+    motion_speedup: float = DEFAULT_MOTION_SPEEDUP,
 ) -> None:
+    if episode_steps <= 0:
+        raise ValueError(f"episode_steps must be positive, got {episode_steps}")
+    if motion_speedup <= 0.0:
+        raise ValueError(f"motion_speedup must be positive, got {motion_speedup}")
+
     frequency = 10.0
     dt = 1 / frequency
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -786,7 +837,10 @@ def main(
     cv2.setNumThreads(1)
 
     time.sleep(1.0)
-    print("Ready!")
+    print(
+        f"Ready! episode_steps={episode_steps}, motion_speedup={motion_speedup}, "
+        f"video_seconds={episode_steps / 30.0:.1f} at 30 FPS"
+    )
     t_start = time.monotonic()
     iter_idx = 0
     episode_id = len(list(Path(output_dir).glob("episode_*.hdf5")))
@@ -812,6 +866,7 @@ def main(
     motion_planner = MotionPlanner(workspace_constraints)
     current_trajectory = None
     trajectory_step = 0
+    episode_step = 0
 
     # Auto-recording setup
     auto_record = True  # Set to True for automatic data collection
@@ -825,7 +880,7 @@ def main(
     right_base_mat = pose_convert(right_base, PoseType.POS_QUAT, PoseType.MAT)[0]
     world_t_bases = np.stack([left_base_mat, right_base_mat])
     trial_num = 0
-    trajectory_steps = 300
+    trajectory_steps = 0
 
     while not stop:
         # pump obs
@@ -864,6 +919,7 @@ def main(
             episode_start_time = None
             current_trajectory = None
             trajectory_step = 0
+            episode_step = 0
             trial_num += 1
             continue
 
@@ -873,16 +929,21 @@ def main(
             episode_start_time = time.monotonic()
             current_trajectory = None  # Force new trajectory generation
             trajectory_step = 0
+            episode_step = 0
             print(f"Auto-started recording episode {episode_id}")
 
         if auto_record and is_recording and episode_start_time is not None:
-            # Check if episode duration elapsed
-            if trajectory_step >= trajectory_steps:
+            # Check if the fixed episode horizon elapsed. Individual motion
+            # segments can be shorter; the loop replans more segments until this
+            # full recording horizon is reached.
+            if episode_step >= episode_steps and episode_has_frames(episode):
                 # Auto-save episode
                 init_pose = env_state_to_mat(episode["env_state"][0])
                 final_pose = env_state_to_mat(episode["env_state"][-1])
                 actions = np.stack(episode["action"])
-                episode_success = success_fn(init_pose, final_pose, actions)
+                episode_success = evaluate_collection_success(
+                    motion_type, init_pose, final_pose, actions
+                )
                 if episode_success:
                     print(f"Episode {episode_id} was successful!")
                     save_episode(episode, output_dir, episode_id)
@@ -907,6 +968,9 @@ def main(
                     shape,
                 )
                 is_recording = False
+                current_trajectory = None
+                trajectory_step = 0
+                episode_step = 0
                 print(
                     f"One episode takes {time.monotonic() - episode_start_time} seconds"
                 )
@@ -922,22 +986,12 @@ def main(
         # Generate scripted policy actions
         puppet_target_state = np.zeros(14)
 
-        # Check if we need to generate a new trajectory
-        if current_trajectory is None:
+        # Check if we need to generate a new faster motion segment. A saved
+        # episode can contain multiple planned segments, so the video stays long
+        # while per-frame displacement is larger.
+        if current_trajectory is None or trajectory_step >= len(current_trajectory):
             success = False
             while not success:
-                episode = init_episode()
-                task_reset(
-                    env,
-                    episode_id,
-                    kin_helper,
-                    k_p,
-                    k_v,
-                    acc_lim,
-                    vel_lim,
-                    headless,
-                    shape,
-                )
                 obs = env._env.task.get_observation(env._env.physics)
 
                 # Extract pushed-object information.  `shape is None` keeps the
@@ -953,12 +1007,18 @@ def main(
                     obs, kin_helper, world_t_bases
                 )
 
-                # Plan new trajectory
-                current_trajectory, success, success_fn, trajectory_steps = (
+                # Plan a segment, then resample it to execute the same geometric
+                # path in fewer steps.
+                current_trajectory, success, _segment_success_fn, trajectory_steps = (
                     motion_planner.plan_episode(
                         object_info, current_arm_pos, motion_type
                     )
                 )
+                if success:
+                    current_trajectory = speed_up_trajectory(
+                        current_trajectory, motion_speedup
+                    )
+                    trajectory_steps = len(current_trajectory)
             trajectory_step = 0
 
         # Get target positions from trajectory
@@ -987,6 +1047,7 @@ def main(
 
         if is_recording:
             episode = update_episode(episode, obs, target_xy_clip, kin_helper)
+            episode_step += 1
 
         # execute teleop command
         env.step(puppet_target_state)
