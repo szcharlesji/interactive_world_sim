@@ -149,7 +149,7 @@ apptainer exec --nv \
       experiment.training.checkpointing.every_n_train_steps=10000 \
       experiment.training.data.num_workers=4 \
       experiment.validation.batch_size=2 \
-      experiment.validation.val_every_n_step=500 \
+      experiment.validation.val_every_n_step=30000 \
       experiment.validation.limit_batch=1.0 \
       experiment.validation.data.num_workers=4 \
       algorithm.latent_dim=512 \
