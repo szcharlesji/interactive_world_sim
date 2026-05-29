@@ -49,7 +49,10 @@ from interactive_world_sim.utils.motion_planner import (
 )
 from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
 
-PLANAR_PUSH_EEF_Z = 0.014
+# Procedural letters have center z ~= 0.014 and half-height ~= 0.012, so the
+# top surface is around z=0.026. Push just below the top to avoid catching the
+# letter on the sloped lower part of the open claws.
+PLANAR_PUSH_EEF_Z = 0.022
 PLANAR_PUSH_GRIPPER = 1.0
 
 
@@ -61,6 +64,17 @@ def freeze_planar_grippers_open(env: AlohaEnv) -> None:
     if physics.data.ctrl.shape[0] >= 14:
         physics.data.ctrl[6] = PUPPET_GRIPPER_POSITION_OPEN
         physics.data.ctrl[13] = PUPPET_GRIPPER_POSITION_OPEN
+    physics.forward()
+
+
+def restore_planar_object_pose(env: AlohaEnv, object_pose: np.ndarray) -> None:
+    """Restore the pushed object after moving ALOHA to a safe reset pose."""
+    physics = env._env.physics
+    joint_id = physics.model.name2id("push_object_joint", "joint")
+    qpos_start = physics.model.jnt_qposadr[joint_id]
+    dof_start = physics.model.jnt_dofadr[joint_id]
+    physics.data.qpos[qpos_start : qpos_start + 7] = object_pose
+    physics.data.qvel[dof_start : dof_start + 6] = 0.0
     physics.forward()
 
 
@@ -184,6 +198,96 @@ def get_current_arm_positions(
     return np.concatenate([left_xy, right_xy])
 
 
+def _points_inside_planar_object_strokes(
+    points_xy: np.ndarray,
+    object_info: PlanarObjectInfo,
+    margin: float = 0.002,
+) -> np.ndarray:
+    """Return a mask for points whose XY projection overlaps letter material.
+
+    The procedural letters are unions of box strokes.  Checking against that
+    union catches actual claw/finger overlap while avoiding false positives from
+    empty holes inside letters such as A, H, and O.
+    """
+    if len(points_xy) == 0:
+        return np.zeros((0,), dtype=bool)
+
+    cos_r, sin_r = np.cos(object_info.rotation), np.sin(object_info.rotation)
+    object_rot = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+    object_local = (points_xy - object_info.center[None]) @ object_rot
+
+    inside_any = np.zeros((len(points_xy),), dtype=bool)
+    for part in object_info.spec.parts:
+        part_cos, part_sin = np.cos(part.yaw), np.sin(part.yaw)
+        part_rot = np.array([[part_cos, -part_sin], [part_sin, part_cos]])
+        part_local = (object_local - np.array(part.pos[:2])[None]) @ part_rot
+        hx, hy = part.size[:2]
+        inside_part = (np.abs(part_local[:, 0]) <= hx + margin) & (
+            np.abs(part_local[:, 1]) <= hy + margin
+        )
+        inside_any |= inside_part
+    return inside_any
+
+
+def _append_segment_samples(
+    samples: list[np.ndarray], start_xy: np.ndarray, end_xy: np.ndarray, n: int = 7
+) -> None:
+    for alpha in np.linspace(0.0, 1.0, n):
+        samples.append((1.0 - alpha) * start_xy + alpha * end_xy)
+
+
+def _get_named_xyz(physics, kind: str, name: str) -> Optional[np.ndarray]:
+    try:
+        if kind == "site":
+            return np.asarray(
+                physics.named.data.site_xpos[name], dtype=np.float64
+            ).copy()
+        if kind == "geom":
+            return np.asarray(
+                physics.named.data.geom_xpos[name], dtype=np.float64
+            ).copy()
+    except (KeyError, ValueError):
+        return None
+    return None
+
+
+def get_current_claw_xy_samples(
+    env: AlohaEnv,
+    obs: dict,
+    kin_helper: KinHelper,
+    world_t_bases: np.ndarray,
+) -> np.ndarray:
+    """Sample core XY points on both open grippers for top-overlap rejection.
+
+    Deliberately do not sample fingertip contact spheres or the open span between
+    fingers: those are expected to touch/partly overlap the letter during valid
+    side pushes, including two-claw contact.
+    """
+    physics = env._env.physics
+    samples: list[np.ndarray] = []
+
+    for arm in ("left", "right"):
+        gripper = _get_named_xyz(physics, "site", f"{arm}/gripper")
+        finger_sites = [
+            _get_named_xyz(physics, "site", f"{arm}/left_finger"),
+            _get_named_xyz(physics, "site", f"{arm}/right_finger"),
+        ]
+
+        samples.extend(p[:2] for p in [gripper, *finger_sites] if p is not None)
+
+        if gripper is not None:
+            for finger in finger_sites:
+                if finger is not None:
+                    _append_segment_samples(samples, gripper[:2], finger[:2], n=4)
+
+    if samples:
+        return np.asarray(samples, dtype=np.float64)
+
+    # Fallback for unexpected MJCF naming changes: preserve the old EEF-center
+    # behavior instead of silently disabling the safety check.
+    return get_current_arm_positions(obs, kin_helper, world_t_bases).reshape(2, 2)
+
+
 def are_eefs_outside_object_footprint(
     obs: dict,
     shape: str,
@@ -191,12 +295,7 @@ def are_eefs_outside_object_footprint(
     world_t_bases: np.ndarray,
     inset: float = 0.004,
 ) -> bool:
-    """Reject frames where an EEF center is inside the letter footprint.
-
-    Contact should happen from the side; if the EEF center enters the object's
-    XY footprint, the claw is likely visually overlapping, hooked, or passing
-    through a hole in the letter.
-    """
+    """Return whether EEF centers are outside the object's outer envelope."""
     object_info = extract_planar_object_info(obs["env_state"], shape)
     analyzer = PlanarObjectGeometryAnalyzer(object_info)
     points = analyzer.all_contact_points
@@ -210,6 +309,42 @@ def are_eefs_outside_object_footprint(
         & (eef_xy[:, 1] < y_max)
     )
     return not bool(inside.any())
+
+
+def are_claws_clear_of_object_footprint(
+    env: AlohaEnv,
+    obs: dict,
+    shape: str,
+    kin_helper: KinHelper,
+    world_t_bases: np.ndarray,
+    material_margin: float = -0.006,
+) -> bool:
+    """Reject only deep/core claw overlap with letter material.
+
+    A negative margin shrinks each stroke before testing, so normal boundary
+    contact from one or both claws is allowed.  This guard is only meant to catch
+    obvious cases where the gripper body is on top of the letter.
+    """
+    object_info = extract_planar_object_info(obs["env_state"], shape)
+    claw_xy = get_current_claw_xy_samples(env, obs, kin_helper, world_t_bases)
+    return not bool(
+        _points_inside_planar_object_strokes(
+            claw_xy,
+            object_info,
+            margin=material_margin,
+        ).any()
+    )
+
+
+def is_planar_push_frame_valid(
+    env: AlohaEnv,
+    obs: dict,
+    shape: str,
+    kin_helper: KinHelper,
+    world_t_bases: np.ndarray,
+) -> bool:
+    """Return whether a procedural-letter frame is safe to keep."""
+    return is_planar_object_pose_valid(obs["env_state"])
 
 
 def trajectory_to_joint_actions(
@@ -305,6 +440,10 @@ def dict_list_to_np(episode: dict) -> dict:
     return episode
 
 
+def episode_has_frames(episode: dict) -> bool:
+    return len(episode["env_state"]) > 0
+
+
 def save_episode(episode: dict, output_dir: str, episode_id: int) -> None:
     ### create config dict
     config_dict: dict = {
@@ -353,7 +492,7 @@ def save_episode(episode: dict, output_dir: str, episode_id: int) -> None:
 
         out.release()
 
-    print(f"Episode {episode_id} saved!")
+    print(f"Episode {episode_id} saved to {output_dir}!")
 
 
 def visualize_object_keypoints_on_camera(
@@ -460,6 +599,22 @@ def vis_obs(
     return vis_img
 
 
+def save_rejected_episode(
+    episode: dict,
+    output_dir: str,
+    rejected_episode_id: int,
+    obs: dict,
+    action: np.ndarray,
+    kin_helper: KinHelper,
+) -> int:
+    """Save an aborted rollout/snapshot for debugging invalid letter episodes."""
+    rejected_dir = os.path.join(output_dir, "rejected")
+    os.makedirs(rejected_dir, exist_ok=True)
+    episode = update_episode(episode, obs, action, kin_helper)
+    save_episode(episode, rejected_dir, rejected_episode_id)
+    return rejected_episode_id + 1
+
+
 def update_episode(
     episode: dict, obs: dict, action: np.ndarray, kin_helper: KinHelper
 ) -> dict:
@@ -511,12 +666,11 @@ def generate_random_init_action(
         object_info = extract_planar_object_info(obs["env_state"], shape)
         analyzer = PlanarObjectGeometryAnalyzer(object_info)
         points = analyzer.all_contact_points
-        x_min, y_min = points.min(axis=0)
-        x_max, y_max = points.max(axis=0)
-        center_y = (y_min + y_max) / 2.0 + np.random.uniform(-0.02, 0.02)
-        clearance = 0.10
-        left_xy = np.array([x_min - clearance, center_y])
-        right_xy = np.array([x_max + clearance, center_y])
+        _, y_min = points.min(axis=0)
+        _, y_max = points.max(axis=0)
+        center_y = (y_min + y_max) / 2.0 + np.random.uniform(-0.015, 0.015)
+        left_xy = np.array([-0.22, center_y])
+        right_xy = np.array([0.22, center_y])
         left_xy[0] = np.clip(left_xy[0], -0.25, 0.25)
         right_xy[0] = np.clip(right_xy[0], -0.25, 0.25)
         left_xy[1] = np.clip(left_xy[1], -0.2, 0.2)
@@ -553,6 +707,7 @@ def task_reset(
     if shape is not None:
         freeze_planar_grippers_open(env)
     obs = env._env.task.get_observation(env._env.physics)
+    reset_object_pose = obs["env_state"].copy() if shape is not None else None
     left_base = obs["left_base"][None]
     right_base = obs["right_base"][None]
     left_base_mat = pose_convert(left_base, PoseType.POS_QUAT, PoseType.MAT)[0]
@@ -586,6 +741,10 @@ def task_reset(
             vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
             cv2.imshow("Aloha Dataset Collection", vis_img)
             cv2.waitKey(1)
+
+    if shape is not None and reset_object_pose is not None:
+        restore_planar_object_pose(env, reset_object_pose)
+        freeze_planar_grippers_open(env)
 
 
 @click.command()
@@ -630,7 +789,11 @@ def main(
     print("Ready!")
     t_start = time.monotonic()
     iter_idx = 0
-    episode_id = len(os.listdir(output_dir))
+    episode_id = len(list(Path(output_dir).glob("episode_*.hdf5")))
+    rejected_dir = Path(output_dir) / "rejected"
+    rejected_episode_id = (
+        len(list(rejected_dir.glob("episode_*.hdf5"))) if rejected_dir.exists() else 0
+    )
     init_episode_id = episode_id
     stop = False
     is_recording = False
@@ -668,14 +831,22 @@ def main(
         # pump obs
         obs = env._env.task.get_observation(env._env.physics)  # noqa
 
-        if shape is not None and (
-            not is_planar_object_pose_valid(obs["env_state"])
-            or not are_eefs_outside_object_footprint(
-                obs, shape, kin_helper, world_t_bases
-            )
+        if shape is not None and not is_planar_push_frame_valid(
+            env, obs, shape, kin_helper, world_t_bases
         ):
+            reject_action = get_current_arm_positions(obs, kin_helper, world_t_bases)
+            rejected_episode_id = save_rejected_episode(
+                episode if episode_has_frames(episode) else init_episode(),
+                output_dir,
+                rejected_episode_id,
+                obs,
+                reject_action,
+                kin_helper,
+            )
             print(
-                f"Episode {episode_id} aborted: object tipped/lifted or claw overlapped the letter. Resetting."
+                f"Episode {episode_id} aborted and saved as rejected "
+                f"episode {rejected_episode_id - 1}: object tipped/lifted. "
+                "Resetting."
             )
             episode = init_episode()
             task_reset(
