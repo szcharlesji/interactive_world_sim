@@ -179,4 +179,4 @@ optuna_studies/
 .DS_Store
 .claude
 
-.err
+*.err
