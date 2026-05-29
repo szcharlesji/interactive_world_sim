@@ -178,3 +178,5 @@ lightning_logs/
 optuna_studies/
 .DS_Store
 .claude
+
+.err
