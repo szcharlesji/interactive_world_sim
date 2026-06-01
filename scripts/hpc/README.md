@@ -193,6 +193,30 @@ rm -rf outputs/bimanual_rope
 sbatch scripts/hpc/train_all_stages.sbatch bimanual_rope full
 ```
 
+### Merge continued S2 dynamics with S3 decoder
+
+If S3 was launched from an older S2 checkpoint and S2 later kept improving,
+create a single checkpoint with encoder+dynamics from the newer S2 checkpoint
+and decoder from the S3 checkpoint:
+
+```bash
+python scripts/merge_stage2_stage3_checkpoint.py \
+  --stage2_ckpt /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2/checkpoints/last.ckpt \
+  --stage3_ckpt /scratch/$USER/interactive_world_sim/outputs/pusht/stage_3/checkpoints/last.ckpt \
+  --out /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_s3_decoder
+```
+
+Then visualize the merged checkpoint on validation episodes:
+
+```bash
+sbatch scripts/hpc/viz_stage2_trainset.sbatch \
+  pusht \
+  full \
+  /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_s3_decoder/checkpoints/last.ckpt \
+  "" \
+  val
+```
+
 ---
 
 ## Sbatch resource block (and how to change it)
