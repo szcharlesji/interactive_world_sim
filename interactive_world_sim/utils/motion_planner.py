@@ -1,10 +1,12 @@
-"""Motion planner for generating human-like bimanual T-pushing trajectories.
-Generates 4 types of motions: linear, rotating, random contact, and random no-contact.
+"""Motion planner for generating human-like bimanual planar pushing trajectories.
+Generates linear, rotating, random contact, random no-contact, and mixed motions.
 """
 
+import json
 import random
 from dataclasses import dataclass
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 from gym_aloha.planar_objects import PlanarObjectSpec
@@ -1069,8 +1071,23 @@ def evaluate_random_contact_success(
     return is_flat and is_moved and actions_in_range(actions)
 
 
+def wrap_angle(angle: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+@dataclass
+class RLCoverageTransition:
+    """Bookkeeping for one high-level RL coverage action."""
+
+    state_key: tuple[int, int, int]
+    action_key: str
+    start_center: np.ndarray
+    start_rotation: float
+
+
 class MotionPlanner:
-    """Plans 4 types of motions with specified ratios: linear(30%), rotating(30%), random contact(30%), random no-contact(10%)."""
+    """Plans scripted planar pushing motions, including diverse mixed rollouts."""
 
     def __init__(self, workspace_constraints: WorkspaceConstraints = None):
         self.constraints = workspace_constraints or WorkspaceConstraints()
@@ -1087,6 +1104,41 @@ class MotionPlanner:
             "random_contact": 0.3,
             "random_no_contact": 0.1,
         }
+        # Mixed rollouts should be interaction-heavy but still include a little
+        # free-space motion so the world model sees both contact and non-contact
+        # actions in the same episode.
+        self.mixed_motion_probabilities = {
+            "linear": 0.35,
+            "rotating": 0.35,
+            "random_contact": 0.25,
+            "random_no_contact": 0.05,
+        }
+        self._last_mixed_motion_type: Optional[str] = None
+
+        # Online high-level RL for coverage collection.  The learner chooses
+        # between safe scripted translation/rotation/contact primitives and
+        # updates a tabular contextual bandit from observed object-pose change.
+        self.rl_actions = [
+            "push_right",
+            "push_left",
+            "push_up",
+            "push_down",
+            "rotate_cw",
+            "rotate_ccw",
+            "tangent_cw",
+            "tangent_ccw",
+        ]
+        self.rl_q_values: Dict[tuple[tuple[int, int, int], str], float] = {}
+        self.rl_action_counts: Dict[tuple[tuple[int, int, int], str], int] = {}
+        self.rl_pose_counts: Dict[tuple[int, int, int], int] = {}
+        self.rl_theta_counts: Dict[int, int] = {}
+        self.rl_total_updates = 0
+        self.rl_epsilon = 0.20
+        self.rl_ucb_bonus = 0.35
+        self.rl_alpha = 0.25
+        self._last_rl_transition: Optional[RLCoverageTransition] = None
+        self.loaded_rl_checkpoint_extra_state: dict = {}
+        self.reset_rl_episode()
 
     def plan_episode(
         self,
@@ -1155,21 +1207,598 @@ class MotionPlanner:
                 duration,
                 num_steps,
             )
+        elif motion_type == "mixed":
+            traj, success, success_fn = self._plan_mixed_motion(
+                t_analyzer,
+                collision_checker,
+                current_arm_positions,
+            )
+            num_steps = len(traj)
+        elif motion_type == "rl_coverage":
+            traj, success, success_fn = self._plan_rl_coverage_motion(
+                t_analyzer,
+                collision_checker,
+                current_arm_positions,
+            )
+            num_steps = len(traj)
         else:
             raise ValueError(f"Unknown motion type: {motion_type}")
         return traj, success, success_fn, num_steps
 
     def _select_motion_type(self) -> str:
         """Select motion type based on probabilities."""
-        rand_val = random.random()
-        cumulative_prob = 0.0
+        return self._sample_weighted(self.motion_probabilities, fallback="linear")
 
-        for motion_type, prob in self.motion_probabilities.items():
-            cumulative_prob += prob
-            if rand_val <= cumulative_prob:
-                return motion_type
+    def _sample_weighted(self, weights: Dict[str, float], fallback: str) -> str:
+        """Sample a key from unnormalized positive weights."""
+        positive_items = [
+            (key, float(weight)) for key, weight in weights.items() if weight > 0.0
+        ]
+        if not positive_items:
+            return fallback
+        total = sum(weight for _, weight in positive_items)
+        threshold = random.random() * total
+        cumulative = 0.0
+        for key, weight in positive_items:
+            cumulative += weight
+            if threshold <= cumulative:
+                return key
+        return positive_items[-1][0]
 
-        return "linear"  # fallback
+    def _safe_linear_direction_weights(self, center: np.ndarray) -> Dict[str, float]:
+        """Prefer inward/tangential pushes when the object is near a table edge."""
+        x, y = center[:2]
+        edge_margin = 0.06
+        weights = {
+            "horizontal_right": 1.0,
+            "horizontal_left": 1.0,
+            "vertical_up": 1.0,
+            "vertical_down": 1.0,
+        }
+
+        if x > self.constraints.x_max - edge_margin:
+            weights["horizontal_right"] = 0.0
+            weights["horizontal_left"] += 2.0
+        if x < self.constraints.x_min + edge_margin:
+            weights["horizontal_left"] = 0.0
+            weights["horizontal_right"] += 2.0
+        if y > self.constraints.y_max - edge_margin:
+            weights["vertical_up"] = 0.0
+            weights["vertical_down"] += 2.0
+        if y < self.constraints.y_min + edge_margin:
+            weights["vertical_down"] = 0.0
+            weights["vertical_up"] += 2.0
+
+        if all(weight <= 0.0 for weight in weights.values()):
+            return {
+                "horizontal_right": 1.0,
+                "horizontal_left": 1.0,
+                "vertical_up": 1.0,
+                "vertical_down": 1.0,
+            }
+        return weights
+
+    def _linear_direction_to_vector(self, direction: str) -> np.ndarray:
+        direction_vectors = {
+            "horizontal_right": np.array([1.0, 0.0]),
+            "horizontal_left": np.array([-1.0, 0.0]),
+            "vertical_up": np.array([0.0, 1.0]),
+            "vertical_down": np.array([0.0, -1.0]),
+        }
+        return direction_vectors[direction]
+
+    def save_rl_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        extra_state: Optional[dict] = None,
+    ) -> None:
+        """Save persistent online RL coverage state to a JSON checkpoint."""
+        path = Path(checkpoint_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "collector_state": extra_state or {},
+            "rl_actions": self.rl_actions,
+            "rl_total_updates": int(self.rl_total_updates),
+            "rl_q_values": [
+                {
+                    "state": list(state_key),
+                    "action": action_key,
+                    "value": float(value),
+                }
+                for (state_key, action_key), value in sorted(self.rl_q_values.items())
+            ],
+            "rl_action_counts": [
+                {
+                    "state": list(state_key),
+                    "action": action_key,
+                    "count": int(count),
+                }
+                for (state_key, action_key), count in sorted(
+                    self.rl_action_counts.items()
+                )
+            ],
+            "rl_pose_counts": [
+                {"state": list(state_key), "count": int(count)}
+                for state_key, count in sorted(self.rl_pose_counts.items())
+            ],
+            "rl_theta_counts": [
+                {"theta_bin": int(theta_bin), "count": int(count)}
+                for theta_bin, count in sorted(self.rl_theta_counts.items())
+            ],
+        }
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        tmp_path.replace(path)
+
+    def load_rl_checkpoint(self, checkpoint_path: str | Path) -> bool:
+        """Load persistent online RL coverage state from a JSON checkpoint."""
+        path = Path(checkpoint_path)
+        if not path.exists():
+            return False
+
+        payload = json.loads(path.read_text())
+        extra_state = payload.get("collector_state", {})
+        self.loaded_rl_checkpoint_extra_state = (
+            extra_state if isinstance(extra_state, dict) else {}
+        )
+        valid_actions = set(self.rl_actions)
+        self.rl_q_values = {}
+        for entry in payload.get("rl_q_values", []):
+            action_key = str(entry["action"])
+            if action_key not in valid_actions:
+                continue
+            state_key = tuple(int(value) for value in entry["state"])
+            self.rl_q_values[(state_key, action_key)] = float(entry["value"])
+
+        self.rl_action_counts = {}
+        for entry in payload.get("rl_action_counts", []):
+            action_key = str(entry["action"])
+            if action_key not in valid_actions:
+                continue
+            state_key = tuple(int(value) for value in entry["state"])
+            self.rl_action_counts[(state_key, action_key)] = int(entry["count"])
+
+        self.rl_pose_counts = {}
+        for entry in payload.get("rl_pose_counts", []):
+            state_key = tuple(int(value) for value in entry["state"])
+            self.rl_pose_counts[state_key] = int(entry["count"])
+
+        self.rl_theta_counts = {
+            int(entry["theta_bin"]): int(entry["count"])
+            for entry in payload.get("rl_theta_counts", [])
+        }
+        self.rl_total_updates = int(payload.get("rl_total_updates", 0))
+        self.reset_rl_episode()
+        return True
+
+    def reset_rl_episode(self) -> None:
+        """Reset per-episode RL bookkeeping while keeping learned coverage stats."""
+        self._last_rl_transition = None
+        self._rl_episode_translation = 0.0
+        self._rl_episode_rotation = 0.0
+        self._rl_episode_segments = 0
+
+    def end_rl_episode(
+        self,
+        t_info: Optional[TShapeInfo] = None,
+        aborted: bool = False,
+    ) -> None:
+        """Finish the pending RL transition and clear per-episode state."""
+        if t_info is not None:
+            self.observe_rl_segment_end(t_info, aborted=aborted)
+        elif aborted and self._last_rl_transition is not None:
+            self._update_rl_value(self._last_rl_transition, reward=-6.0)
+            self._last_rl_transition = None
+        self.reset_rl_episode()
+
+    def _rl_pose_key(self, center: np.ndarray, rotation: float) -> tuple[int, int, int]:
+        x_bins = 10
+        y_bins = 8
+        theta_bins = 16
+        x_alpha = (center[0] - self.constraints.x_min) / max(
+            self.constraints.x_max - self.constraints.x_min, 1e-8
+        )
+        y_alpha = (center[1] - self.constraints.y_min) / max(
+            self.constraints.y_max - self.constraints.y_min, 1e-8
+        )
+        theta_alpha = (wrap_angle(rotation) + np.pi) / (2.0 * np.pi)
+        x_bin = int(np.clip(np.floor(x_alpha * x_bins), 0, x_bins - 1))
+        y_bin = int(np.clip(np.floor(y_alpha * y_bins), 0, y_bins - 1))
+        theta_bin = int(np.clip(np.floor(theta_alpha * theta_bins), 0, theta_bins - 1))
+        return x_bin, y_bin, theta_bin
+
+    def _action_to_direction(self, action_key: str) -> Optional[str]:
+        return {
+            "push_right": "horizontal_right",
+            "push_left": "horizontal_left",
+            "push_up": "vertical_up",
+            "push_down": "vertical_down",
+        }.get(action_key)
+
+    def _is_translation_action(self, action_key: str) -> bool:
+        return action_key.startswith("push_")
+
+    def _is_rotation_action(self, action_key: str) -> bool:
+        return action_key.startswith("rotate_") or action_key.startswith("tangent_")
+
+    def _safe_rl_actions(self, center: np.ndarray) -> list[str]:
+        """Filter high-level actions that would push outward near workspace edges."""
+        direction_weights = self._safe_linear_direction_weights(center)
+        actions = []
+        for action in self.rl_actions:
+            direction = self._action_to_direction(action)
+            if direction is None or direction_weights[direction] > 0.0:
+                actions.append(action)
+        return actions or ["rotate_cw", "rotate_ccw", "tangent_cw", "tangent_ccw"]
+
+    def _predicted_coverage_bonus(
+        self, center: np.ndarray, rotation: float, action_key: str
+    ) -> float:
+        predicted_center = center.copy()
+        predicted_rotation = rotation
+        if action_key == "push_right":
+            predicted_center += np.array([0.055, 0.0])
+        elif action_key == "push_left":
+            predicted_center += np.array([-0.055, 0.0])
+        elif action_key == "push_up":
+            predicted_center += np.array([0.0, 0.055])
+        elif action_key == "push_down":
+            predicted_center += np.array([0.0, -0.055])
+        elif action_key in ["rotate_cw", "tangent_cw"]:
+            predicted_rotation = wrap_angle(rotation - 0.35)
+        elif action_key in ["rotate_ccw", "tangent_ccw"]:
+            predicted_rotation = wrap_angle(rotation + 0.35)
+
+        state_key = self._rl_pose_key(predicted_center, predicted_rotation)
+        pose_count = self.rl_pose_counts.get(state_key, 0)
+        theta_count = self.rl_theta_counts.get(state_key[2], 0)
+        return 0.50 / np.sqrt(pose_count + 1.0) + 0.25 / np.sqrt(theta_count + 1.0)
+
+    def _select_rl_action(self, t_analyzer: TGeometryAnalyzer) -> str:
+        center = t_analyzer.t_info.center
+        rotation = t_analyzer.t_info.rotation
+        state_key = self._rl_pose_key(center, rotation)
+        available_actions = self._safe_rl_actions(center)
+
+        # Hard curriculum: force both translation and rotation attempts early in
+        # every <=600-frame rollout so saved RL episodes contain both effects.
+        if self._rl_episode_translation < 0.025 and self._rl_episode_segments <= 2:
+            translation_actions = [
+                action
+                for action in available_actions
+                if self._is_translation_action(action)
+            ]
+            if translation_actions:
+                return self._sample_weighted(
+                    {
+                        action: self._safe_linear_direction_weights(center)[
+                            self._action_to_direction(action)
+                        ]
+                        for action in translation_actions
+                    },
+                    fallback=translation_actions[0],
+                )
+        if self._rl_episode_rotation < 0.12 and self._rl_episode_segments <= 4:
+            rotation_actions = [
+                action
+                for action in available_actions
+                if self._is_rotation_action(action)
+            ]
+            if rotation_actions:
+                return random.choice(rotation_actions)
+
+        if random.random() < self.rl_epsilon:
+            return random.choice(available_actions)
+
+        log_total = np.log(self.rl_total_updates + 2.0)
+        best_action = available_actions[0]
+        best_score = -np.inf
+        for action in available_actions:
+            key = (state_key, action)
+            count = self.rl_action_counts.get(key, 0)
+            q_value = self.rl_q_values.get(key, 0.0)
+            exploration = self.rl_ucb_bonus * np.sqrt(log_total / (count + 1.0))
+            balance_bonus = 0.0
+            if (
+                self._is_translation_action(action)
+                and self._rl_episode_translation < 0.04
+            ):
+                balance_bonus += 0.8
+            if self._is_rotation_action(action) and self._rl_episode_rotation < 0.18:
+                balance_bonus += 0.8
+            score = (
+                q_value
+                + exploration
+                + balance_bonus
+                + self._predicted_coverage_bonus(center, rotation, action)
+            )
+            if score > best_score:
+                best_score = score
+                best_action = action
+        return best_action
+
+    def _update_rl_value(self, transition: RLCoverageTransition, reward: float) -> None:
+        key = (transition.state_key, transition.action_key)
+        old_value = self.rl_q_values.get(key, 0.0)
+        count = self.rl_action_counts.get(key, 0)
+        step_size = max(self.rl_alpha, 1.0 / float(count + 1))
+        self.rl_q_values[key] = old_value + step_size * (reward - old_value)
+        self.rl_action_counts[key] = count + 1
+        self.rl_total_updates += 1
+
+    def observe_rl_segment_end(
+        self,
+        t_info: TShapeInfo,
+        aborted: bool = False,
+    ) -> None:
+        """Update the RL table from the previous segment outcome."""
+        if self._last_rl_transition is None:
+            state_key = self._rl_pose_key(t_info.center, t_info.rotation)
+            self.rl_pose_counts[state_key] = self.rl_pose_counts.get(state_key, 0) + 1
+            self.rl_theta_counts[state_key[2]] = (
+                self.rl_theta_counts.get(state_key[2], 0) + 1
+            )
+            return
+
+        transition = self._last_rl_transition
+        translation = float(np.linalg.norm(t_info.center - transition.start_center))
+        rotation = abs(wrap_angle(t_info.rotation - transition.start_rotation))
+        state_key = self._rl_pose_key(t_info.center, t_info.rotation)
+        previous_pose_count = self.rl_pose_counts.get(state_key, 0)
+        previous_theta_count = self.rl_theta_counts.get(state_key[2], 0)
+
+        self._rl_episode_translation += translation
+        self._rl_episode_rotation += rotation
+        self.rl_pose_counts[state_key] = previous_pose_count + 1
+        self.rl_theta_counts[state_key[2]] = previous_theta_count + 1
+
+        reward = 0.0
+        reward += 1.50 / np.sqrt(previous_pose_count + 1.0)
+        reward += 0.75 / np.sqrt(previous_theta_count + 1.0)
+        reward += 1.00 * min(translation / 0.08, 1.0)
+        reward += 1.25 * min(rotation / 0.45, 1.0)
+        if translation < 0.006 and rotation < 0.04:
+            reward -= 0.5
+
+        x, y = t_info.center[:2]
+        edge_distance = min(
+            x - self.constraints.x_min,
+            self.constraints.x_max - x,
+            y - self.constraints.y_min,
+            self.constraints.y_max - y,
+        )
+        if edge_distance < 0.0:
+            reward -= 5.0
+        elif edge_distance < 0.025:
+            reward -= 2.0 * (0.025 - edge_distance) / 0.025
+        if aborted:
+            reward -= 6.0
+
+        self._update_rl_value(transition, reward)
+        self._last_rl_transition = None
+
+    def _plan_rl_coverage_motion(
+        self,
+        t_analyzer: TGeometryAnalyzer,
+        collision_checker: CollisionChecker,
+        current_pos: np.ndarray,
+    ) -> tuple[np.ndarray, bool, callable]:
+        """Plan one online-RL coverage segment.
+
+        This is a contextual bandit over safe scripted primitives, not raw-joint
+        RL.  That keeps collection stable while still adapting toward actions
+        that create new object position/yaw coverage with both translation and
+        rotation inside short episodes.
+        """
+        self.observe_rl_segment_end(t_analyzer.t_info)
+        state_key = self._rl_pose_key(
+            t_analyzer.t_info.center, t_analyzer.t_info.rotation
+        )
+        max_attempts = 16
+
+        for _ in range(max_attempts):
+            action = self._select_rl_action(t_analyzer)
+            direction = self._action_to_direction(action)
+
+            if direction is not None:
+                num_steps = random.randint(100, 160)
+                traj, success, success_fn = self._plan_linear_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    direction=direction,
+                )
+            elif action == "rotate_cw":
+                num_steps = random.randint(120, 190)
+                traj, success, success_fn = self._plan_rotating_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    direction="clockwise",
+                )
+            elif action == "rotate_ccw":
+                num_steps = random.randint(120, 190)
+                traj, success, success_fn = self._plan_rotating_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    direction="counterclockwise",
+                )
+            else:
+                num_steps = random.randint(100, 170)
+                contact_style = (
+                    "tangential_cw" if action == "tangent_cw" else "tangential_ccw"
+                )
+                traj, success, success_fn = self._plan_random_contact_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    contact_style=contact_style,
+                )
+
+            if success and actions_in_range(traj):
+                self._last_rl_transition = RLCoverageTransition(
+                    state_key=state_key,
+                    action_key=action,
+                    start_center=t_analyzer.t_info.center.copy(),
+                    start_rotation=float(t_analyzer.t_info.rotation),
+                )
+                self._rl_episode_segments += 1
+                return traj, True, success_fn
+
+            self._update_rl_value(
+                RLCoverageTransition(
+                    state_key=state_key,
+                    action_key=action,
+                    start_center=t_analyzer.t_info.center.copy(),
+                    start_rotation=float(t_analyzer.t_info.rotation),
+                ),
+                reward=-1.0,
+            )
+
+        traj, success, success_fn = self._plan_random_contact_motion(
+            t_analyzer,
+            collision_checker,
+            current_pos,
+            duration=12.0,
+            num_steps=120,
+            contact_style="tangential_ccw",
+        )
+        if success:
+            self._last_rl_transition = RLCoverageTransition(
+                state_key=state_key,
+                action_key="tangent_ccw",
+                start_center=t_analyzer.t_info.center.copy(),
+                start_rotation=float(t_analyzer.t_info.rotation),
+            )
+            self._rl_episode_segments += 1
+        return traj, success, success_fn
+
+    def _sample_mixed_motion_type(self, center: np.ndarray) -> str:
+        """Sample a diverse mixed sub-motion with light anti-repetition and edge bias."""
+        weights = dict(self.mixed_motion_probabilities)
+
+        # Do not let one primitive dominate a long episode.
+        if self._last_mixed_motion_type in weights:
+            weights[self._last_mixed_motion_type] *= 0.35
+
+        # Near edges, rotations and small contacts are safer than large linear
+        # outward pushes, but keep some linear probability for inward pushes.
+        x, y = center[:2]
+        edge_margin = 0.06
+        near_edge = (
+            x > self.constraints.x_max - edge_margin
+            or x < self.constraints.x_min + edge_margin
+            or y > self.constraints.y_max - edge_margin
+            or y < self.constraints.y_min + edge_margin
+        )
+        if near_edge:
+            weights["linear"] *= 0.7
+            weights["rotating"] *= 1.3
+            weights["random_contact"] *= 1.2
+            weights["random_no_contact"] *= 1.5
+
+        return self._sample_weighted(weights, fallback="linear")
+
+    def _plan_mixed_motion(
+        self,
+        t_analyzer: TGeometryAnalyzer,
+        collision_checker: CollisionChecker,
+        current_pos: np.ndarray,
+    ) -> tuple[np.ndarray, bool, callable]:
+        """Plan one diverse sub-segment for a mixed rollout.
+
+        Mixed episodes are generated by repeatedly calling this method as the
+        object moves.  Each call re-reads the current object pose, samples a new
+        primitive, and uses boundary-aware direction choices so long episodes
+        contain translation, rotation, contact, and occasional non-contact data.
+        """
+        center = t_analyzer.t_info.center
+        max_attempts = 16
+
+        for _ in range(max_attempts):
+            sub_motion = self._sample_mixed_motion_type(center)
+
+            if sub_motion == "linear":
+                direction_weights = self._safe_linear_direction_weights(center)
+                direction = self._sample_weighted(
+                    direction_weights, fallback="horizontal_right"
+                )
+                num_steps = random.randint(120, 180)
+                traj, success, success_fn = self._plan_linear_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    direction=direction,
+                )
+            elif sub_motion == "rotating":
+                num_steps = random.randint(160, 260)
+                traj, success, success_fn = self._plan_rotating_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    direction=random.choice(["clockwise", "counterclockwise"]),
+                )
+            elif sub_motion == "random_contact":
+                direction_name = self._sample_weighted(
+                    self._safe_linear_direction_weights(center),
+                    fallback="horizontal_right",
+                )
+                contact_style = self._sample_weighted(
+                    {"cardinal": 0.45, "tangential": 0.45, "corner": 0.10},
+                    fallback="cardinal",
+                )
+                num_steps = random.randint(110, 220)
+                traj, success, success_fn = self._plan_random_contact_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                    preferred_push_direction=self._linear_direction_to_vector(
+                        direction_name
+                    ),
+                    contact_style=contact_style,
+                )
+            else:
+                num_steps = random.randint(80, 150)
+                traj, success, success_fn = self._plan_random_no_contact_motion(
+                    t_analyzer,
+                    collision_checker,
+                    current_pos,
+                    duration=num_steps / 10.0,
+                    num_steps=num_steps,
+                )
+
+            if success and actions_in_range(traj):
+                self._last_mixed_motion_type = sub_motion
+                return traj, True, success_fn
+
+        # Conservative fallback: a small no-contact move avoids hanging the
+        # collector if all sampled interaction primitives are out of range.
+        traj, success, success_fn = self._plan_random_no_contact_motion(
+            t_analyzer,
+            collision_checker,
+            current_pos,
+            duration=10.0,
+            num_steps=100,
+        )
+        if success:
+            self._last_mixed_motion_type = "random_no_contact"
+        return traj, success, success_fn
 
     def _plan_linear_motion(
         self,
@@ -1178,16 +1807,17 @@ class MotionPlanner:
         current_pos: np.ndarray,
         duration: float,
         num_steps: int,
+        direction: Optional[str] = None,
     ) -> tuple[np.ndarray, bool, callable]:
         """Plan linear pushing motion."""
-        # Randomly select push direction
         directions = [
             "horizontal_right",
             "horizontal_left",
             "vertical_up",
             "vertical_down",
         ]
-        direction = random.choice(directions)
+        if direction is None:
+            direction = random.choice(directions)
 
         waypoints = t_analyzer.get_linear_push_waypoints(direction)
         if direction == "horizontal_right":
@@ -1236,10 +1866,11 @@ class MotionPlanner:
         current_pos: np.ndarray,
         duration: float,
         num_steps: int,
+        direction: Optional[str] = None,
     ) -> tuple[np.ndarray, bool, callable]:
         """Plan rotating motion."""
-        # Randomly select rotation direction
-        direction = random.choice(["clockwise", "counterclockwise"])
+        if direction is None:
+            direction = random.choice(["clockwise", "counterclockwise"])
 
         waypoints = t_analyzer.get_rotation_waypoints(direction)
         for i, p in enumerate(waypoints["left"]):
@@ -1282,6 +1913,8 @@ class MotionPlanner:
         current_pos: np.ndarray,
         duration: float,
         num_steps: int,
+        preferred_push_direction: Optional[np.ndarray] = None,
+        contact_style: Optional[str] = None,
     ) -> tuple[np.ndarray, bool, callable]:
         """Plan random contact motion."""
         if isinstance(t_analyzer, PlanarObjectGeometryAnalyzer):
@@ -1290,6 +1923,8 @@ class MotionPlanner:
                 current_pos,
                 duration,
                 num_steps,
+                preferred_push_direction=preferred_push_direction,
+                contact_style=contact_style,
             )
 
         # Randomly select contact points
@@ -1349,25 +1984,91 @@ class MotionPlanner:
         current_pos: np.ndarray,
         duration: float,
         num_steps: int,
+        preferred_push_direction: Optional[np.ndarray] = None,
+        contact_style: Optional[str] = None,
     ) -> tuple[np.ndarray, bool, callable]:
-        """Plan a one-arm exterior side push for generic letters.
+        """Plan a one-arm exterior push for generic letters.
 
         Two-arm random contact often traps letters between claws or hooks holes
-        in shapes like A/H/O.  For procedural letters, use one active side-push
-        while the other arm stabilizes away from the object.
+        in shapes like A/H/O.  For procedural letters, use one active pusher and
+        diversify the contact geometry: cardinal side pushes for translation,
+        tangential pushes for rotation, and occasional corner shoves.
         """
-        use_left_arm = random.random() < 0.5
-        side = "left" if use_left_arm else "right"
-        contacts = t_analyzer.select_contact_point(side)
-        if len(contacts) == 0:
-            contacts = t_analyzer.contact_points
-        contact = contacts[np.random.choice(len(contacts))].copy()
+        center = t_analyzer.object_info.center
+        contact_style = contact_style or self._sample_weighted(
+            {"cardinal": 0.55, "tangential": 0.35, "corner": 0.10},
+            fallback="cardinal",
+        )
 
-        approach_distance = 0.055
-        push_distance = 0.055
-        push_dir = np.array([1.0, 0.0]) if use_left_arm else np.array([-1.0, 0.0])
+        def normalized(vec: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+            norm = np.linalg.norm(vec)
+            if norm < 1e-8:
+                return fallback.copy()
+            return vec / norm
+
+        approach_distance = random.uniform(0.035, 0.065)
+        push_distance = random.uniform(0.035, 0.085)
+
+        cardinal_options = [
+            (np.array([1.0, 0.0]), "left"),
+            (np.array([-1.0, 0.0]), "right"),
+            (np.array([0.0, 1.0]), "down"),
+            (np.array([0.0, -1.0]), "up"),
+        ]
+
+        if contact_style == "cardinal":
+            if preferred_push_direction is not None:
+                preferred = normalized(preferred_push_direction, np.array([1.0, 0.0]))
+                push_dir, side = max(
+                    cardinal_options,
+                    key=lambda option: float(np.dot(option[0], preferred)),
+                )
+            else:
+                push_dir, side = random.choice(cardinal_options)
+            contacts = t_analyzer.select_contact_point(side)
+            if len(contacts) == 0:
+                contacts = t_analyzer.contact_points
+            contact = contacts[np.random.choice(len(contacts))].copy()
+        elif contact_style == "corner":
+            points = t_analyzer.contact_points
+            radii = np.linalg.norm(points - center[None], axis=1)
+            radius_threshold = np.quantile(radii, 0.80)
+            candidates = points[radii >= radius_threshold]
+            if len(candidates) == 0:
+                candidates = points
+            contact = candidates[np.random.choice(len(candidates))].copy()
+            inward = normalized(center - contact, np.array([1.0, 0.0]))
+            tangent = np.array([-inward[1], inward[0]])
+            if random.random() < 0.5:
+                tangent *= -1.0
+            push_dir = normalized(0.75 * inward + 0.25 * tangent, inward)
+        else:
+            points = t_analyzer.contact_points
+            contact = points[np.random.choice(len(points))].copy()
+            radial = normalized(contact - center, np.array([1.0, 0.0]))
+            if contact_style == "tangential_cw":
+                push_dir = np.array([radial[1], -radial[0]])
+            elif contact_style == "tangential_ccw":
+                push_dir = np.array([-radial[1], radial[0]])
+            else:
+                push_dir = np.array([-radial[1], radial[0]])
+                if random.random() < 0.5:
+                    push_dir *= -1.0
+
         approach = contact - push_dir * approach_distance
         pushed = contact + push_dir * push_distance
+
+        # Choose the active arm based on push direction and contact location.
+        # Horizontal pushes should use the arm on the contacting side.  Mostly
+        # vertical/tangential pushes choose the arm closer to that contact point.
+        if push_dir[0] > 0.25:
+            use_left_arm = True
+        elif push_dir[0] < -0.25:
+            use_left_arm = False
+        elif abs(contact[0] - center[0]) > 0.01:
+            use_left_arm = contact[0] <= center[0]
+        else:
+            use_left_arm = random.random() < 0.5
 
         if use_left_arm:
             active_waypoints = [current_pos[:2], approach, contact, pushed]

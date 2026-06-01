@@ -9,11 +9,13 @@ Scripted Data Collection with Auto-Recording:
   - Press "S" to stop recording
   - Press "Backspace" to delete the previously recorded episode
 
-The system uses a scripted policy that generates 4 types of motions:
-1. Linear pushes (30%): Coordinated pushing in different directions
-2. Rotations (30%): Rotating the T-shape by gripping corners
-3. Random contact (30%): Random contact points with collision avoidance
-4. Random exploration (10%): Non-contact exploration motions
+The system uses scripted and online-RL policies:
+1. Linear pushes: Coordinated pushing in different directions
+2. Rotations: Rotating the object by gripping/pushing exterior points
+3. Random contact: Random exterior side/corner/tangential contacts
+4. Random exploration: Non-contact exploration motions
+5. Mixed: Replans diverse interaction-heavy sub-motions within each episode
+6. RL coverage: Online contextual-bandit primitive selection for translation + rotation coverage
 """
 
 # %%
@@ -48,6 +50,7 @@ from interactive_world_sim.utils.motion_planner import (
     WorkspaceConstraints,
     evaluate_random_contact_success,
     evaluate_random_motion_success,
+    wrap_angle,
 )
 from interactive_world_sim.utils.pose_utils import PoseType, pose_convert
 
@@ -58,6 +61,21 @@ PLANAR_PUSH_EEF_Z = 0.022
 PLANAR_PUSH_GRIPPER = 1.0
 DEFAULT_EPISODE_STEPS = 600
 DEFAULT_MOTION_SPEEDUP = 5.0
+MAX_RL_COVERAGE_EPISODE_STEPS = 600
+DEFAULT_RL_WARMUP_EPISODES = 0
+DEFAULT_RL_CHECKPOINT_INTERVAL = 1
+RL_CHECKPOINT_FILENAME = "rl_policy_checkpoint.json"
+TABLE_X_LIMIT = 0.61
+TABLE_Y_LIMIT = 0.37
+TABLE_EDGE_MARGIN = 0.03
+SUPPORTED_MOTION_TYPES = {
+    "linear",
+    "rotating",
+    "random_contact",
+    "random_no_contact",
+    "mixed",
+    "rl_coverage",
+}
 
 
 def speed_up_trajectory(trajectory: np.ndarray, speedup: float) -> np.ndarray:
@@ -83,6 +101,16 @@ def evaluate_collection_success(
     """
     if motion_type == "random_no_contact":
         return evaluate_random_motion_success(init_pose, final_pose, actions)
+    if motion_type == "rl_coverage":
+        initial_yaw = np.arctan2(init_pose[1, 0], init_pose[0, 0])
+        final_yaw = np.arctan2(final_pose[1, 0], final_pose[0, 0])
+        xy_translation = float(np.linalg.norm(final_pose[:2, 3] - init_pose[:2, 3]))
+        yaw_rotation = abs(wrap_angle(final_yaw - initial_yaw))
+        return (
+            evaluate_random_contact_success(init_pose, final_pose, actions)
+            and xy_translation > 0.015
+            and yaw_rotation > 0.08
+        )
     return evaluate_random_contact_success(init_pose, final_pose, actions)
 
 
@@ -197,6 +225,46 @@ def extract_planar_object_info(env_state: np.ndarray, shape: str) -> PlanarObjec
         rotation=rotation_angle,
         pose=world_t_obj,
         spec=get_planar_object_spec(shape),
+    )
+
+
+def planar_object_footprint_xy(env_state: np.ndarray, shape: str) -> np.ndarray:
+    """Return world-frame XY corners for all procedural letter box strokes."""
+    object_info = extract_planar_object_info(env_state, shape)
+    local_points = []
+    for part in object_info.spec.parts:
+        hx, hy = part.size[:2]
+        corners = np.array(
+            [
+                [-hx, -hy],
+                [hx, -hy],
+                [hx, hy],
+                [-hx, hy],
+            ],
+            dtype=np.float64,
+        )
+        part_cos, part_sin = np.cos(part.yaw), np.sin(part.yaw)
+        part_rot = np.array([[part_cos, -part_sin], [part_sin, part_cos]])
+        local_points.append(np.array(part.pos[:2])[None] + corners @ part_rot.T)
+
+    local_points_xy = np.concatenate(local_points, axis=0)
+    obj_cos, obj_sin = np.cos(object_info.rotation), np.sin(object_info.rotation)
+    obj_rot = np.array([[obj_cos, -obj_sin], [obj_sin, obj_cos]])
+    return object_info.center[None] + local_points_xy @ obj_rot.T
+
+
+def is_planar_object_on_table(env_state: np.ndarray, shape: str) -> bool:
+    """Return whether the whole letter footprint remains on the MuJoCo table."""
+    footprint = planar_object_footprint_xy(env_state, shape)
+    x_min = -TABLE_X_LIMIT + TABLE_EDGE_MARGIN
+    x_max = TABLE_X_LIMIT - TABLE_EDGE_MARGIN
+    y_min = -TABLE_Y_LIMIT + TABLE_EDGE_MARGIN
+    y_max = TABLE_Y_LIMIT - TABLE_EDGE_MARGIN
+    return bool(
+        (footprint[:, 0] >= x_min).all()
+        and (footprint[:, 0] <= x_max).all()
+        and (footprint[:, 1] >= y_min).all()
+        and (footprint[:, 1] <= y_max).all()
     )
 
 
@@ -374,7 +442,9 @@ def is_planar_push_frame_valid(
     world_t_bases: np.ndarray,
 ) -> bool:
     """Return whether a procedural-letter frame is safe to keep."""
-    return is_planar_object_pose_valid(obs["env_state"])
+    return is_planar_object_pose_valid(obs["env_state"]) and is_planar_object_on_table(
+        obs["env_state"], shape
+    )
 
 
 def trajectory_to_joint_actions(
@@ -781,7 +851,15 @@ def task_reset(
 @click.option(
     "--output_dir", "-o", default=".", help="Directory to save demonstration dataset."
 )
-@click.option("--motion_type", "-mt", default="random_no_contact", help="Motion type.")
+@click.option(
+    "--motion_type",
+    "-mt",
+    default="random_no_contact",
+    help=(
+        "Motion type: linear, rotating, random_contact, random_no_contact, "
+        "mixed, or rl_coverage."
+    ),
+)
 @click.option(
     "--shape",
     "-s",
@@ -806,6 +884,36 @@ def task_reset(
     show_default=True,
     help="Resample each planned motion segment by this factor before execution.",
 )
+@click.option(
+    "--rl_warmup_episodes",
+    default=DEFAULT_RL_WARMUP_EPISODES,
+    type=int,
+    show_default=True,
+    help=(
+        "For rl_coverage only: number of full episode horizons to use for "
+        "online policy learning before saving successful HDF5/MP4 episodes."
+    ),
+)
+@click.option(
+    "--rl_checkpoint_path",
+    default=None,
+    type=str,
+    help=(
+        "For rl_coverage only: JSON checkpoint path for the online policy. "
+        "Default: <output_dir>/rl_policy_checkpoint.json. Existing checkpoints "
+        "are loaded automatically."
+    ),
+)
+@click.option(
+    "--rl_checkpoint_interval",
+    default=DEFAULT_RL_CHECKPOINT_INTERVAL,
+    type=int,
+    show_default=True,
+    help=(
+        "For rl_coverage only: save the online policy checkpoint every N full "
+        "episode horizons. Abort penalties are checkpointed immediately."
+    ),
+)
 def main(
     output_dir: str,
     motion_type: str = "random_no_contact",
@@ -813,11 +921,40 @@ def main(
     headless: bool = False,
     episode_steps: int = DEFAULT_EPISODE_STEPS,
     motion_speedup: float = DEFAULT_MOTION_SPEEDUP,
+    rl_warmup_episodes: int = DEFAULT_RL_WARMUP_EPISODES,
+    rl_checkpoint_path: Optional[str] = None,
+    rl_checkpoint_interval: int = DEFAULT_RL_CHECKPOINT_INTERVAL,
 ) -> None:
+    if motion_type not in SUPPORTED_MOTION_TYPES:
+        valid = ", ".join(sorted(SUPPORTED_MOTION_TYPES))
+        raise ValueError(f"Unknown motion_type '{motion_type}'. Valid: {valid}")
     if episode_steps <= 0:
         raise ValueError(f"episode_steps must be positive, got {episode_steps}")
+    if motion_type == "rl_coverage" and episode_steps > MAX_RL_COVERAGE_EPISODE_STEPS:
+        raise ValueError(
+            "rl_coverage is designed for <=20s videos; use "
+            f"--episode_steps {MAX_RL_COVERAGE_EPISODE_STEPS} or lower"
+        )
     if motion_speedup <= 0.0:
         raise ValueError(f"motion_speedup must be positive, got {motion_speedup}")
+    if rl_warmup_episodes < 0:
+        raise ValueError(
+            f"rl_warmup_episodes must be non-negative, got {rl_warmup_episodes}"
+        )
+    if rl_checkpoint_interval <= 0:
+        raise ValueError(
+            f"rl_checkpoint_interval must be positive, got {rl_checkpoint_interval}"
+        )
+    if motion_type != "rl_coverage" and rl_warmup_episodes > 0:
+        print(
+            "WARNING: --rl_warmup_episodes is only used by "
+            f"--motion_type rl_coverage; ignoring value {rl_warmup_episodes}."
+        )
+    if motion_type != "rl_coverage" and rl_checkpoint_path is not None:
+        print(
+            "WARNING: --rl_checkpoint_path is only used by "
+            f"--motion_type rl_coverage; ignoring value {rl_checkpoint_path}."
+        )
 
     frequency = 10.0
     dt = 1 / frequency
@@ -837,9 +974,19 @@ def main(
     cv2.setNumThreads(1)
 
     time.sleep(1.0)
+    resolved_rl_checkpoint_path = None
+    if motion_type == "rl_coverage":
+        resolved_rl_checkpoint_path = (
+            Path(rl_checkpoint_path)
+            if rl_checkpoint_path
+            else Path(output_dir) / RL_CHECKPOINT_FILENAME
+        )
+
     print(
         f"Ready! episode_steps={episode_steps}, motion_speedup={motion_speedup}, "
-        f"video_seconds={episode_steps / 30.0:.1f} at 30 FPS"
+        f"video_seconds={episode_steps / 30.0:.1f} at 30 FPS, "
+        f"rl_warmup_episodes={rl_warmup_episodes}, "
+        f"rl_checkpoint_path={resolved_rl_checkpoint_path}"
     )
     t_start = time.monotonic()
     iter_idx = 0
@@ -864,6 +1011,18 @@ def main(
         y_max=0.2,
     )
     motion_planner = MotionPlanner(workspace_constraints)
+    if motion_type == "rl_coverage" and resolved_rl_checkpoint_path is not None:
+        if motion_planner.load_rl_checkpoint(resolved_rl_checkpoint_path):
+            print(
+                "Loaded RL coverage checkpoint from "
+                f"{resolved_rl_checkpoint_path} "
+                f"with {motion_planner.rl_total_updates} updates."
+            )
+        else:
+            print(
+                "No existing RL coverage checkpoint found; will save to "
+                f"{resolved_rl_checkpoint_path}."
+            )
     current_trajectory = None
     trajectory_step = 0
     episode_step = 0
@@ -881,28 +1040,84 @@ def main(
     world_t_bases = np.stack([left_base_mat, right_base_mat])
     trial_num = 0
     trajectory_steps = 0
+    rl_warmup_completed = 0
+    if motion_type == "rl_coverage":
+        loaded_warmup_completed = int(
+            motion_planner.loaded_rl_checkpoint_extra_state.get(
+                "rl_warmup_completed", 0
+            )
+        )
+        rl_warmup_completed = min(loaded_warmup_completed, rl_warmup_episodes)
+        if loaded_warmup_completed > 0:
+            print(
+                f"Resumed RL warmup progress: {rl_warmup_completed}/"
+                f"{rl_warmup_episodes}."
+            )
+    rl_checkpoint_events = 0
+
+    def maybe_save_rl_checkpoint(reason: str, force: bool = False) -> None:
+        nonlocal rl_checkpoint_events
+        if motion_type != "rl_coverage" or resolved_rl_checkpoint_path is None:
+            return
+        rl_checkpoint_events += 1
+        if force or rl_checkpoint_events % rl_checkpoint_interval == 0:
+            motion_planner.save_rl_checkpoint(
+                resolved_rl_checkpoint_path,
+                extra_state={
+                    "rl_warmup_completed": rl_warmup_completed,
+                    "rl_warmup_episodes": rl_warmup_episodes,
+                },
+            )
+            print(
+                f"Saved RL coverage checkpoint ({reason}) to "
+                f"{resolved_rl_checkpoint_path} "
+                f"with {motion_planner.rl_total_updates} updates."
+            )
 
     while not stop:
         # pump obs
         obs = env._env.task.get_observation(env._env.physics)  # noqa
 
+        rl_warmup_active = (
+            motion_type == "rl_coverage" and rl_warmup_completed < rl_warmup_episodes
+        )
+
         if shape is not None and not is_planar_push_frame_valid(
             env, obs, shape, kin_helper, world_t_bases
         ):
-            reject_action = get_current_arm_positions(obs, kin_helper, world_t_bases)
-            rejected_episode_id = save_rejected_episode(
-                episode if episode_has_frames(episode) else init_episode(),
-                output_dir,
-                rejected_episode_id,
-                obs,
-                reject_action,
-                kin_helper,
-            )
-            print(
-                f"Episode {episode_id} aborted and saved as rejected "
-                f"episode {rejected_episode_id - 1}: object tipped/lifted. "
-                "Resetting."
-            )
+            if motion_type == "rl_coverage":
+                try:
+                    motion_planner.end_rl_episode(
+                        extract_planar_object_info(obs["env_state"], shape),
+                        aborted=True,
+                    )
+                except Exception:
+                    motion_planner.end_rl_episode(aborted=True)
+            if rl_warmup_active:
+                print(
+                    "RL warmup rollout aborted: object tipped/lifted/out of table. "
+                    "Policy received abort penalty; not saving rejected snapshot. "
+                    "Resetting."
+                )
+            else:
+                reject_action = get_current_arm_positions(
+                    obs, kin_helper, world_t_bases
+                )
+                rejected_episode_id = save_rejected_episode(
+                    episode if episode_has_frames(episode) else init_episode(),
+                    output_dir,
+                    rejected_episode_id,
+                    obs,
+                    reject_action,
+                    kin_helper,
+                )
+                print(
+                    f"Episode {episode_id} aborted and saved as rejected "
+                    f"episode {rejected_episode_id - 1}: object tipped/lifted/out of table. "
+                    "Resetting."
+                )
+            if motion_type == "rl_coverage":
+                maybe_save_rl_checkpoint("abort", force=True)
             episode = init_episode()
             task_reset(
                 env,
@@ -920,7 +1135,8 @@ def main(
             current_trajectory = None
             trajectory_step = 0
             episode_step = 0
-            trial_num += 1
+            if not rl_warmup_active:
+                trial_num += 1
             continue
 
         # Auto-recording logic
@@ -930,7 +1146,15 @@ def main(
             current_trajectory = None  # Force new trajectory generation
             trajectory_step = 0
             episode_step = 0
-            print(f"Auto-started recording episode {episode_id}")
+            if motion_type == "rl_coverage":
+                motion_planner.reset_rl_episode()
+            if rl_warmup_active:
+                print(
+                    f"Auto-started RL warmup episode {rl_warmup_completed + 1}/"
+                    f"{rl_warmup_episodes}"
+                )
+            else:
+                print(f"Auto-started recording episode {episode_id}")
 
         if auto_record and is_recording and episode_start_time is not None:
             # Check if the fixed episode horizon elapsed. Individual motion
@@ -941,20 +1165,43 @@ def main(
                 init_pose = env_state_to_mat(episode["env_state"][0])
                 final_pose = env_state_to_mat(episode["env_state"][-1])
                 actions = np.stack(episode["action"])
+                if motion_type == "rl_coverage":
+                    if shape is None:
+                        final_object_info = extract_t_info(episode["env_state"][-1])
+                    else:
+                        final_object_info = extract_planar_object_info(
+                            episode["env_state"][-1], shape
+                        )
+                    motion_planner.end_rl_episode(final_object_info)
                 episode_success = evaluate_collection_success(
                     motion_type, init_pose, final_pose, actions
                 )
-                if episode_success:
-                    print(f"Episode {episode_id} was successful!")
-                    save_episode(episode, output_dir, episode_id)
-                    episode_id += 1
+                if rl_warmup_active:
+                    rl_warmup_completed += 1
+                    status = "successful" if episode_success else "not successful"
+                    print(
+                        f"RL warmup episode {rl_warmup_completed}/"
+                        f"{rl_warmup_episodes} completed ({status}); "
+                        "policy updated, not saving HDF5/MP4."
+                    )
+                    if rl_warmup_completed >= rl_warmup_episodes:
+                        print(
+                            "RL warmup complete; future successful episodes will save."
+                        )
                 else:
-                    print(f"Episode {episode_id} was NOT successful!")
-                trial_num += 1
-                print(
-                    "Current success rate: ",
-                    float(episode_id - init_episode_id) / float(trial_num),
-                )
+                    if episode_success:
+                        print(f"Episode {episode_id} was successful!")
+                        save_episode(episode, output_dir, episode_id)
+                        episode_id += 1
+                    else:
+                        print(f"Episode {episode_id} was NOT successful!")
+                    trial_num += 1
+                    print(
+                        "Current success rate: ",
+                        float(episode_id - init_episode_id) / float(trial_num),
+                    )
+                if motion_type == "rl_coverage":
+                    maybe_save_rl_checkpoint("episode")
                 episode = init_episode()
                 task_reset(
                     env,
