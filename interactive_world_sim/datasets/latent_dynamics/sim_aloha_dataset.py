@@ -72,17 +72,18 @@ def _convert_real_to_dp_replay(
     meta_group = root.require_group("meta", overwrite=True)
 
     episodes_paths = glob.glob(os.path.join(dataset_dir, "episode_*.hdf5"))
-    episodes_stem_name = [Path(path).stem for path in episodes_paths]
-    episodes_idx = [int(stem_name.split("_")[-1]) for stem_name in episodes_stem_name]
-    episodes_idx = sorted(episodes_idx)
+    episode_items = sorted(
+        (int(Path(path).stem.split("_")[-1]), path) for path in episodes_paths
+    )
+    if not episode_items:
+        raise FileNotFoundError(f"No episode_*.hdf5 files found in {dataset_dir}")
 
     episode_ends = list()
     prev_end = 0
     lowdim_data_dict: dict = dict()
     rgb_data_dict: dict = dict()
     depth_data_dict: dict = dict()
-    for epi_idx in tqdm(episodes_idx, desc="Loading episodes"):
-        dataset_path = os.path.join(dataset_dir, f"episode_{epi_idx}.hdf5")
+    for _, dataset_path in tqdm(episode_items, desc="Loading episodes"):
         with h5py.File(dataset_path) as file:
             # count total steps
             episode_length = file["action"].shape[0]
@@ -252,9 +253,12 @@ def load_replay_buffer(
                     print("Saving cache to disk.")
                     with zarr.ZipStore(cache_zarr_path) as zip_store:
                         replay_buffer.save_to_store(store=zip_store)
-                except Exception as e:
-                    shutil.rmtree(cache_zarr_path)
-                    raise e
+                except Exception:
+                    if os.path.isdir(cache_zarr_path):
+                        shutil.rmtree(cache_zarr_path)
+                    elif os.path.exists(cache_zarr_path):
+                        os.remove(cache_zarr_path)
+                    raise
             else:
                 print("Loading cached ReplayBuffer from Disk.")
                 with zarr.ZipStore(cache_zarr_path, mode="r") as zip_store:
