@@ -56,32 +56,51 @@ def parse_tokens(value: str | None) -> list[str]:
     return [token.strip() for token in value.replace(",", " ").split() if token.strip()]
 
 
-def resolve_letters(
-    source_dir: Path, letters_arg: str | None, exclude_arg: str | None
-) -> list[str]:
-    """Resolve the requested letter list."""
-    available = sorted(
+def available_letters(source_dir: Path) -> list[str]:
+    """Return available procedural-letter directories."""
+    return sorted(
         path.name.upper()
         for path in source_dir.iterdir()
         if path.is_dir() and len(path.name) == 1 and path.name.upper() in ALL_LETTERS
     )
-    if letters_arg:
-        requested = [token.upper() for token in parse_tokens(letters_arg)]
-    else:
-        requested = available
 
-    exclude = {token.upper() for token in parse_tokens(exclude_arg)}
-    letters = [letter for letter in requested if letter not in exclude]
+
+def validate_letters(
+    source_dir: Path, requested: list[str], *, label: str = "letters"
+) -> list[str]:
+    """Validate and filter a requested letter list against the source dir."""
+    available = available_letters(source_dir)
+    letters = [letter.upper() for letter in requested]
 
     invalid = [letter for letter in letters if letter not in ALL_LETTERS]
     if invalid:
-        raise ValueError(f"Invalid letter(s): {invalid}")
+        raise ValueError(f"Invalid {label}: {invalid}")
 
     missing = [letter for letter in letters if letter not in available]
     if missing:
-        print(f"WARNING: requested letters not found under {source_dir}: {missing}")
+        print(f"WARNING: requested {label} not found under {source_dir}: {missing}")
 
-    return [letter for letter in letters if letter in available]
+    result = []
+    seen = set()
+    for letter in letters:
+        if letter in available and letter not in seen:
+            result.append(letter)
+            seen.add(letter)
+    return result
+
+
+def resolve_letters(
+    source_dir: Path, letters_arg: str | None, exclude_arg: str | None
+) -> list[str]:
+    """Resolve the requested letter list."""
+    available = available_letters(source_dir)
+    requested = [token.upper() for token in parse_tokens(letters_arg)] or available
+    exclude = {token.upper() for token in parse_tokens(exclude_arg)}
+    return validate_letters(
+        source_dir,
+        [letter for letter in requested if letter not in exclude],
+        label="letters",
+    )
 
 
 def resolve_motions(
@@ -197,7 +216,38 @@ def prepare_dataset(args: argparse.Namespace) -> None:
                 f"output_dir already exists: {output_dir}. Use --overwrite or choose a new path."
             )
 
-    letters = resolve_letters(source_dir, args.letters, args.exclude_letters)
+    explicit_letter_split = bool(args.train_letters or args.val_letters)
+    if explicit_letter_split:
+        if not args.train_letters or not args.val_letters:
+            raise ValueError(
+                "--train_letters and --val_letters must be provided together"
+            )
+        if args.letters or args.exclude_letters:
+            raise ValueError(
+                "--letters/--exclude_letters cannot be combined with "
+                "--train_letters/--val_letters"
+            )
+        train_letters = validate_letters(
+            source_dir,
+            [token.upper() for token in parse_tokens(args.train_letters)],
+            label="train_letters",
+        )
+        val_letters = validate_letters(
+            source_dir,
+            [token.upper() for token in parse_tokens(args.val_letters)],
+            label="val_letters",
+        )
+        overlap = sorted(set(train_letters).intersection(val_letters))
+        if overlap:
+            raise ValueError(f"train_letters and val_letters overlap: {overlap}")
+        letters = train_letters + [
+            letter for letter in val_letters if letter not in train_letters
+        ]
+    else:
+        train_letters = []
+        val_letters = []
+        letters = resolve_letters(source_dir, args.letters, args.exclude_letters)
+
     motions = resolve_motions(source_dir, letters, args.motions)
     groups = collect_sources(
         source_dir=source_dir,
@@ -212,6 +262,14 @@ def prepare_dataset(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"No episodes found under {source_dir} for letters={letters} motions={motions}"
         )
+    if explicit_letter_split:
+        train_group_count = sum(1 for letter, _ in groups if letter in train_letters)
+        val_group_count = sum(1 for letter, _ in groups if letter in val_letters)
+        if train_group_count == 0 or val_group_count == 0:
+            raise RuntimeError(
+                "Explicit split found no train or validation groups: "
+                f"train_groups={train_group_count}, val_groups={val_group_count}"
+            )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "train").mkdir(parents=True, exist_ok=True)
@@ -220,46 +278,75 @@ def prepare_dataset(args: argparse.Namespace) -> None:
     records: list[EpisodeRecord] = []
     counters = {"train": 0, "val": 0}
     group_summaries = []
-    for group_idx, ((letter, motion), paths) in enumerate(sorted(groups.items())):
-        train_paths, val_paths = split_group(
-            paths,
-            val_ratio=args.val_ratio,
-            min_val_per_group=args.min_val_per_group,
-            seed=args.seed + group_idx,
-        )
-        group_summaries.append(
-            {
-                "letter": letter,
-                "motion": motion,
-                "source_episodes": len(paths),
-                "train_episodes": len(train_paths),
-                "val_episodes": len(val_paths),
-            }
-        )
-        for split, split_paths in (("train", train_paths), ("val", val_paths)):
-            for src in split_paths:
-                epi_idx = counters[split]
-                prepared_name = f"episode_{epi_idx:06d}.hdf5"
-                dst = output_dir / split / prepared_name
-                link_or_copy(src, dst, copy=args.copy)
-                records.append(
-                    EpisodeRecord(
-                        source_path=str(src.resolve()),
-                        split=split,
-                        letter=letter,
-                        motion=motion,
-                        source_episode=src.name,
-                        prepared_episode=f"{split}/{prepared_name}",
-                    )
+
+    def add_records(split: str, letter: str, motion: str, paths: list[Path]) -> None:
+        for src in paths:
+            epi_idx = counters[split]
+            prepared_name = f"episode_{epi_idx:06d}.hdf5"
+            dst = output_dir / split / prepared_name
+            link_or_copy(src, dst, copy=args.copy)
+            records.append(
+                EpisodeRecord(
+                    source_path=str(src.resolve()),
+                    split=split,
+                    letter=letter,
+                    motion=motion,
+                    source_episode=src.name,
+                    prepared_episode=f"{split}/{prepared_name}",
                 )
-                counters[split] += 1
+            )
+            counters[split] += 1
+
+    if explicit_letter_split:
+        for (letter, motion), paths in sorted(groups.items()):
+            if letter in train_letters:
+                train_paths = paths
+                val_paths = []
+            elif letter in val_letters:
+                train_paths = []
+                val_paths = paths
+            else:
+                continue
+            group_summaries.append(
+                {
+                    "letter": letter,
+                    "motion": motion,
+                    "source_episodes": len(paths),
+                    "train_episodes": len(train_paths),
+                    "val_episodes": len(val_paths),
+                }
+            )
+            add_records("train", letter, motion, train_paths)
+            add_records("val", letter, motion, val_paths)
+    else:
+        for group_idx, ((letter, motion), paths) in enumerate(sorted(groups.items())):
+            train_paths, val_paths = split_group(
+                paths,
+                val_ratio=args.val_ratio,
+                min_val_per_group=args.min_val_per_group,
+                seed=args.seed + group_idx,
+            )
+            group_summaries.append(
+                {
+                    "letter": letter,
+                    "motion": motion,
+                    "source_episodes": len(paths),
+                    "train_episodes": len(train_paths),
+                    "val_episodes": len(val_paths),
+                }
+            )
+            add_records("train", letter, motion, train_paths)
+            add_records("val", letter, motion, val_paths)
 
     metadata = {
         "source_dir": str(source_dir.resolve()),
         "output_dir": str(output_dir.resolve()),
         "letters": letters,
+        "train_letters": train_letters,
+        "val_letters": val_letters,
         "motions": motions,
         "exclude_letters": parse_tokens(args.exclude_letters),
+        "split_strategy": "explicit_letters" if explicit_letter_split else "ratio",
         "val_ratio": args.val_ratio,
         "min_val_per_group": args.min_val_per_group,
         "min_frames": args.min_frames,
@@ -279,6 +366,9 @@ def prepare_dataset(args: argparse.Namespace) -> None:
     print(f"  source_dir: {source_dir}")
     print(f"  output_dir: {output_dir}")
     print(f"  letters:    {' '.join(letters)}")
+    if explicit_letter_split:
+        print(f"  train set:  {' '.join(train_letters)}")
+        print(f"  val set:    {' '.join(val_letters)}")
     print(f"  motions:    {' '.join(motions)}")
     print(f"  train:      {counters['train']} episodes")
     print(f"  val:        {counters['val']} episodes")
@@ -298,6 +388,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--exclude_letters",
         default=None,
         help="Letters to exclude from the selected/default set, e.g. 'Q X Z'.",
+    )
+    parser.add_argument(
+        "--train_letters",
+        default=None,
+        help=(
+            "Explicit letters for train/. Must be used with --val_letters. "
+            "Disables per-letter random val splitting."
+        ),
+    )
+    parser.add_argument(
+        "--val_letters",
+        default=None,
+        help=(
+            "Explicit letters for val/. Must be used with --train_letters. "
+            "Useful for held-out-letter generalization."
+        ),
     )
     parser.add_argument(
         "--motions",

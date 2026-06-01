@@ -1,0 +1,116 @@
+# Local procedural-letter generalization workflow.
+#
+# The default heldout split is the last six letters. Change heldout_letters if you
+# want a different 20/6 split. With motions=[rl_coverage] and
+# max_episodes_per_letter=50, each letter contributes 50 episodes.
+
+source_dir: data/mujoco/letters
+prepared_root: data/mujoco/letters_prepared/generalization
+output_root: outputs/letters/generalization
+
+python: null  # null = use the interpreter that launches train_letters_generalization.py
+gpu: 0
+seed: 42
+wandb_mode: online
+obs_keys: [top_pov]
+action_dim: 4
+motions: [rl_coverage]
+max_episodes_per_letter: 50
+
+all_letters: [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z]
+heldout_letters: [U, V, W, X, Y, Z]
+
+prepare:
+  mode: if_missing  # if_missing | always | never
+  copy: false       # false = symlink raw HDF5s into prepared datasets
+  min_frames: 1
+  val_ratio: 0.1
+  min_val_per_group: 1
+  check_distribution: true
+
+# Prepared datasets consumed by SimAlohaDataset.
+datasets:
+  # Baseline: all 26 letters are present in both train and val through a
+  # deterministic per-letter 90/10 split. With 50 episodes/letter this is
+  # roughly 45 train + 5 val per letter.
+  all_letters:
+    output_dir: ${prepared_root}/all_letters_50
+    split: ratio
+    letters: all
+    val_ratio: 0.1
+
+  # Heldout generalization: train/ contains 20 non-heldout letters and val/
+  # contains only the six heldout letters.
+  train20_val6:
+    output_dir: ${prepared_root}/train20_val6_50
+    split: explicit
+    train_letters: complement_heldout
+    val_letters: heldout
+
+stage1:
+  horizon: 1
+  val_horizon: 1
+  batch_size: 16
+  val_batch_size: 10
+  max_steps: 200005
+  checkpoint_every: 10000
+  val_every: 6000
+  log_every_n_steps: 100
+  num_workers: 4
+  latent_dim: 512
+  resume: true
+  use_cache: true
+
+stage2:
+  horizon: 10
+  val_horizon: 200
+  batch_size: 32
+  val_batch_size: 2
+  max_steps: 1000005
+  checkpoint_every: 10000
+  val_every: 30000
+  log_every_n_steps: 100
+  num_workers: 4
+  latent_dim: 512
+  resume: true
+  use_cache: true
+  # Copies the selected stage-1 checkpoint and .hydra config into the stage-2
+  # output dir before training. This makes algorithm.load_ae self-contained.
+  snapshot_stage1_ckpt: true
+
+# Stage 1 is trained separately. Run these one at a time.
+stage1_runs:
+  # S1 sees all letters.
+  all_letters:
+    dataset: all_letters
+    run_dir: ${output_root}/all_letters/stage_1
+    run_name: letters_gen_all_stage_1
+
+  # S1 sees only 20 letters; validation is the six heldout letters.
+  train20_val6:
+    dataset: train20_val6
+    run_dir: ${output_root}/s1_train20_s2_train20/stage_1
+    run_name: letters_gen_train20_val6_stage_1
+
+# Stage 2 is trained separately after the referenced stage1_run has a ckpt.
+stage2_runs:
+  # Baseline: S1 and S2 both train/val on all letters.
+  all_letters:
+    dataset: all_letters
+    stage1_run: all_letters
+    run_dir: ${output_root}/all_letters/stage_2
+    run_name: letters_gen_all_stage_2
+
+  # S1 trained on all letters; S2 trains on 20 letters and validates on six heldout letters.
+  s1_all_s2_train20:
+    dataset: train20_val6
+    stage1_run: all_letters
+    run_dir: ${output_root}/s1_all_s2_train20/stage_2
+    run_name: letters_gen_s1_all_s2_train20_stage_2
+
+  # S1 and S2 both train on 20 letters and validate on the same six heldout letters.
+  s1_train20_s2_train20:
+    dataset: train20_val6
+    stage1_run: train20_val6
+    run_dir: ${output_root}/s1_train20_s2_train20/stage_2
+    run_name: letters_gen_s1_train20_s2_train20_stage_2
