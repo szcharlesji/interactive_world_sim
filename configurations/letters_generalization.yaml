@@ -50,8 +50,10 @@ datasets:
 stage1:
   horizon: 1
   val_horizon: 1
-  batch_size: 16
-  val_batch_size: 10
+  # A6000-safe microbatch. Effective batch = 4 * 4 = 16.
+  batch_size: 4
+  accumulate_grad_batches: 4
+  val_batch_size: 4
   max_steps: 200005
   checkpoint_every: 10000
   val_every: 6000
@@ -64,8 +66,10 @@ stage1:
 stage2:
   horizon: 10
   val_horizon: 200
-  batch_size: 32
-  val_batch_size: 2
+  # A6000-safe microbatch. Effective batch = 4 * 8 = 32.
+  batch_size: 4
+  accumulate_grad_batches: 8
+  val_batch_size: 1
   max_steps: 1000005
   checkpoint_every: 10000
   val_every: 30000

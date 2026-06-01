@@ -389,6 +389,7 @@ def append_common_hydra_args(
             f"experiment.training.batch_size={int(stage_cfg['batch_size'])}",
             f"experiment.training.max_steps={int(stage_cfg['max_steps'])}",
             f"experiment.training.log_every_n_steps={int(stage_cfg.get('log_every_n_steps', 100))}",
+            f"experiment.training.optim.accumulate_grad_batches={int(stage_cfg.get('accumulate_grad_batches', 1))}",
             f"experiment.training.checkpointing.every_n_train_steps={int(stage_cfg['checkpoint_every'])}",
             f"experiment.training.data.num_workers={int(stage_cfg.get('num_workers', 4))}",
             f"experiment.validation.batch_size={int(stage_cfg['val_batch_size'])}",
