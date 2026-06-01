@@ -197,13 +197,28 @@ sbatch scripts/hpc/train_all_stages.sbatch bimanual_rope full
 
 If S3 was launched from an older S2 checkpoint and S2 later kept improving,
 create a single checkpoint with encoder+dynamics from the newer S2 checkpoint
-and decoder from the S3 checkpoint:
+and decoder from the S3 checkpoint. The wrapper below requests the `a100`
+partition and runs the merge utility inside the project container:
 
 ```bash
-python scripts/merge_stage2_stage3_checkpoint.py \
-  --stage2_ckpt /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2/checkpoints/last.ckpt \
-  --stage3_ckpt /scratch/$USER/interactive_world_sim/outputs/pusht/stage_3/checkpoints/last.ckpt \
-  --out /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_s3_decoder
+sbatch scripts/hpc/merge_stage2_stage3_checkpoint.sbatch
+```
+
+The defaults are the PushT stage-2-c merge:
+
+```bash
+# S2 source: /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_c/checkpoints/last.ckpt
+# S3 source: /scratch/$USER/interactive_world_sim/outputs/pusht/stage_3/checkpoints/last.ckpt
+# output   : /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_s3_decoder/checkpoints/last.ckpt
+```
+
+You can also pass explicit paths:
+
+```bash
+sbatch scripts/hpc/merge_stage2_stage3_checkpoint.sbatch \
+  /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_c/checkpoints/last.ckpt \
+  /scratch/$USER/interactive_world_sim/outputs/pusht/stage_3/checkpoints/last.ckpt \
+  /scratch/$USER/interactive_world_sim/outputs/pusht/stage_2_s3_decoder
 ```
 
 Then visualize the merged checkpoint on validation episodes:
