@@ -290,8 +290,30 @@ def maybe_check_distribution(
     run_command(cmd, dry_run=dry_run)
 
 
+def parse_gpu_ids(value: str | int | None) -> list[str]:
+    """Parse a CUDA_VISIBLE_DEVICES-style GPU selection."""
+    if value is None:
+        return []
+    return [token.strip() for token in str(value).split(",") if token.strip()]
+
+
+def resolve_gpu_selection(
+    cfg: dict[str, Any], gpus: str | None, gpu: str | None
+) -> tuple[str | None, int]:
+    """Resolve visible GPU IDs and Lightning device count."""
+    selection = gpus
+    if selection is None:
+        selection = gpu
+    if selection is None:
+        selection = cfg_get(cfg, "gpus", cfg_get(cfg, "gpu", None))
+    gpu_ids = parse_gpu_ids(selection)
+    if not gpu_ids:
+        return None, 1
+    return ",".join(gpu_ids), len(gpu_ids)
+
+
 def build_training_env(
-    cfg: dict[str, Any], gpu: str | int | None
+    cfg: dict[str, Any], gpu_selection: str | None
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Build environment for local training commands."""
     env = os.environ.copy()
@@ -305,10 +327,9 @@ def build_training_env(
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     env_prefix: dict[str, str] = {}
-    if gpu is not None:
-        gpu_str = str(gpu)
-        env["CUDA_VISIBLE_DEVICES"] = gpu_str
-        env_prefix["CUDA_VISIBLE_DEVICES"] = gpu_str
+    if gpu_selection is not None:
+        env["CUDA_VISIBLE_DEVICES"] = gpu_selection
+        env_prefix["CUDA_VISIBLE_DEVICES"] = gpu_selection
     return env, env_prefix
 
 
@@ -431,6 +452,7 @@ def train_stage1(
     *,
     cli_prepare_mode: str | None,
     gpu: str | None,
+    gpus: str | None,
     wandb_mode: str | None,
     dry_run: bool,
     resume: bool | None,
@@ -457,6 +479,7 @@ def train_stage1(
     selected_wandb_mode = wandb_mode or str(cfg_get(cfg, "wandb_mode", "online"))
     should_resume = bool(stage_cfg.get("resume", True) if resume is None else resume)
 
+    gpu_selection, num_devices = resolve_gpu_selection(cfg, gpus, gpu)
     cmd = [project_python(cfg), "main.py"]
     append_common_hydra_args(
         cmd,
@@ -469,12 +492,14 @@ def train_stage1(
         training_stage=1,
         wandb_mode=selected_wandb_mode,
     )
+    cmd.append(f"experiment.num_devices={num_devices}")
     add_resume_arg(cmd, run_dir, resume=should_resume, stage_label="stage1")
 
-    env, env_prefix = build_training_env(
-        cfg, gpu if gpu is not None else cfg_get(cfg, "gpu", 0)
+    env, env_prefix = build_training_env(cfg, gpu_selection)
+    print(
+        f"[stage1] Launching run {run_name}: {run_dir} "
+        f"(gpus={gpu_selection or 'default'}, devices={num_devices})"
     )
-    print(f"[stage1] Launching run {run_name}: {run_dir}")
     run_command(cmd, dry_run=dry_run, env=env, env_prefix=env_prefix)
 
 
@@ -564,6 +589,7 @@ def train_stage2(
     *,
     cli_prepare_mode: str | None,
     gpu: str | None,
+    gpus: str | None,
     wandb_mode: str | None,
     dry_run: bool,
     resume: bool | None,
@@ -604,6 +630,7 @@ def train_stage2(
     else:
         print(f"[stage2] Loading stage-1 checkpoint directly: {seed_ckpt}")
 
+    gpu_selection, num_devices = resolve_gpu_selection(cfg, gpus, gpu)
     cmd = [project_python(cfg), "main.py"]
     append_common_hydra_args(
         cmd,
@@ -616,6 +643,7 @@ def train_stage2(
         training_stage=2,
         wandb_mode=selected_wandb_mode,
     )
+    cmd.append(f"experiment.num_devices={num_devices}")
     cmd.extend(
         [
             "algorithm.noise_scheduler.loss_weighting=uniform",
@@ -625,10 +653,11 @@ def train_stage2(
     )
     add_resume_arg(cmd, run_dir, resume=should_resume, stage_label="stage2")
 
-    env, env_prefix = build_training_env(
-        cfg, gpu if gpu is not None else cfg_get(cfg, "gpu", 0)
+    env, env_prefix = build_training_env(cfg, gpu_selection)
+    print(
+        f"[stage2] Launching run {run_name}: {run_dir} "
+        f"(gpus={gpu_selection or 'default'}, devices={num_devices})"
     )
-    print(f"[stage2] Launching run {run_name}: {run_dir}")
     run_command(cmd, dry_run=dry_run, env=env, env_prefix=env_prefix)
 
 
@@ -659,7 +688,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override config prepare.mode.",
     )
-    parser.add_argument("--gpu", default=None, help="Override config GPU index.")
+    parser.add_argument("--gpu", default=None, help="Single-GPU alias for --gpus.")
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help="Comma-separated GPU IDs for CUDA_VISIBLE_DEVICES, e.g. '1,2'.",
+    )
     parser.add_argument(
         "--wandb_mode",
         choices=["online", "offline", "disabled", "dryrun"],
@@ -746,6 +780,7 @@ def main() -> None:
             args.run,
             cli_prepare_mode=args.prepare,
             gpu=args.gpu,
+            gpus=args.gpus,
             wandb_mode=args.wandb_mode,
             dry_run=args.dry_run,
             resume=None if args.resume is None else bool(int(args.resume)),
@@ -758,6 +793,7 @@ def main() -> None:
             args.run,
             cli_prepare_mode=args.prepare,
             gpu=args.gpu,
+            gpus=args.gpus,
             wandb_mode=args.wandb_mode,
             dry_run=args.dry_run,
             resume=None if args.resume is None else bool(int(args.resume)),

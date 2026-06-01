@@ -208,6 +208,10 @@ python scripts/train_letters_generalization.py prepare --dataset all --prepare a
 
 # Use a different local GPU.
 python scripts/train_letters_generalization.py stage2 --run s1_all_s2_train20 --gpu 1
+
+# Use DDP on two visible GPUs, e.g. two RTX A6000s.
+# Do not include an unsupported RTX 5090 in this environment.
+python scripts/train_letters_generalization.py stage1 --run all_letters --gpus 1,2
 ```
 
 ## Important notes

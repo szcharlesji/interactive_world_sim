@@ -9,7 +9,9 @@ prepared_root: data/mujoco/letters_prepared/generalization
 output_root: outputs/letters/generalization
 
 python: null  # null = use the interpreter that launches train_letters_generalization.py
-gpu: 0
+# Comma-separated CUDA_VISIBLE_DEVICES selection. Use only supported GPUs,
+# e.g. the two A6000 IDs, and do not include the RTX 5090 in the current env.
+gpus: "0"
 seed: 42
 wandb_mode: online
 obs_keys: [top_pov]
@@ -50,10 +52,10 @@ datasets:
 stage1:
   horizon: 1
   val_horizon: 1
-  # A6000-safe microbatch. Effective batch = 4 * 4 = 16.
-  batch_size: 4
-  accumulate_grad_batches: 4
-  val_batch_size: 4
+  # 2x A6000 DDP default. Effective batch = 8 * num_gpus.
+  batch_size: 8
+  accumulate_grad_batches: 1
+  val_batch_size: 8
   max_steps: 200005
   checkpoint_every: 10000
   val_every: 6000
@@ -66,9 +68,9 @@ stage1:
 stage2:
   horizon: 10
   val_horizon: 200
-  # A6000-safe microbatch. Effective batch = 4 * 8 = 32.
+  # Conservative 2x A6000 DDP default. Effective batch = 4 * num_gpus * 4.
   batch_size: 4
-  accumulate_grad_batches: 8
+  accumulate_grad_batches: 4
   val_batch_size: 1
   max_steps: 1000005
   checkpoint_every: 10000
