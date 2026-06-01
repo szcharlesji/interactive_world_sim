@@ -197,7 +197,7 @@ sbatch scripts/hpc/train_all_stages.sbatch bimanual_rope full
 
 If S3 was launched from an older S2 checkpoint and S2 later kept improving,
 create a single checkpoint with encoder+dynamics from the newer S2 checkpoint
-and decoder from the S3 checkpoint. The wrapper below requests the `a100`
+and decoder from the S3 checkpoint. The wrapper below requests the `l40s_lpinto`
 partition and runs the merge utility inside the project container:
 
 ```bash

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=torch_pr_37_lpinto
-#SBATCH --partition=a100
+#SBATCH --partition=l40s_lpinto
 #SBATCH --job-name=iws-merge-s2s3
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
