@@ -11,25 +11,29 @@
 #SBATCH --output=logs/s2viz_%j.out
 #SBATCH --error=logs/s2viz_%j.err
 #
-# Stage 2 visualization on the TRAINING set.
-# Loads a stage-2 checkpoint and runs the `validation` task pointed at the
-# train episodes, logging predicted-vs-GT rollout videos to a NEW wandb run
-# named <task>_stage_2[_suffix]_trainviz (separate from the training run).
+# Stage 2-style visualization on either the training or validation set.
+# Loads a checkpoint and runs the `validation` task pointed at the requested
+# split, logging predicted-vs-GT rollout videos to a NEW wandb run named
+# <task>_stage_2[_suffix]_<split>viz (separate from the training run).
 #
-# No training is performed. Reads from outputs/<task>/stage_2[_suffix]/checkpoints/
-# and writes nothing back there except the disjoint trainviz/ run dir.
+# No training is performed. By default it reads from
+# outputs/<task>/stage_2[_suffix]/checkpoints/. You may pass any compatible
+# checkpoint path as s2_ckpt, including a stage-3 checkpoint, while preserving
+# stage-2 rollout validation behavior.
 #
 # Usage:
-#   sbatch scripts/hpc/viz_stage2_trainset.sbatch [task] [data_split] [s2_ckpt] [run_suffix]
+#   sbatch scripts/hpc/viz_stage2_trainset.sbatch [task] [data_split] [ckpt] [run_suffix] [viz_split]
 #     task       = pusht | single_grasp | bimanual_sweep | bimanual_rope   (default: pusht)
 #     data_split = mini | full                                              (default: full)
-#     s2_ckpt    = absolute path to a stage-2 .ckpt                         (default: newest in stage_2/checkpoints/)
+#     ckpt       = absolute path to a compatible .ckpt                      (default: newest in stage_2/checkpoints/)
 #     run_suffix = stage_2 dir suffix to target (matches the trainer's suffix arg).
 #                  Empty -> outputs/<task>/stage_2/.  Suffix "b" -> outputs/<task>/stage_2_b/.
+#     viz_split  = train | val                                              (default: train)
 #
 # Examples:
 #   sbatch scripts/hpc/viz_stage2_trainset.sbatch pusht
-#   sbatch scripts/hpc/viz_stage2_trainset.sbatch pusht full "" b
+#   sbatch scripts/hpc/viz_stage2_trainset.sbatch pusht full "" "" val
+#   sbatch scripts/hpc/viz_stage2_trainset.sbatch pusht full /scratch/cj2220/interactive_world_sim/outputs/pusht/stage_3/checkpoints/last.ckpt "" val
 
 set -euo pipefail
 
@@ -37,13 +41,21 @@ TASK="${1:-pusht}"
 DATA_SPLIT="${2:-full}"
 S2_CKPT_ARG="${3:-}"
 RUN_SUFFIX="${4:-}"
+VIZ_SPLIT="${5:-train}"
 
 REPO=/scratch/$USER/interactive_world_sim
 OVERLAY=$SCRATCH/iws.ext3
 IMAGE=${CONTAINER_IMAGES_FOLDER}/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif
 
 S2_DIR=$REPO/outputs/$TASK/stage_2${RUN_SUFFIX:+_$RUN_SUFFIX}
-VIZ_DIR=$S2_DIR/trainviz
+
+case "$VIZ_SPLIT" in
+  train) VIZ_DATA_DIR="data/$DATA_SPLIT/$TASK/train"; VIZ_NAME=trainviz ;;
+  val)   VIZ_DATA_DIR="data/$DATA_SPLIT/$TASK/val";   VIZ_NAME=valviz ;;
+  *) echo "unknown viz split: $VIZ_SPLIT (expected train or val)"; exit 2 ;;
+esac
+
+VIZ_DIR=$S2_DIR/$VIZ_NAME
 
 mkdir -p logs "$VIZ_DIR"
 
@@ -84,11 +96,11 @@ fi
 
 echo "================================================================"
 echo "[$(date)] Job $SLURM_JOB_ID on $(hostname)"
-echo "  task=$TASK  split=$DATA_SPLIT  suffix=${RUN_SUFFIX:-<none>}"
-echo "  S2 ckpt  : $S2_CKPT"
+echo "  task=$TASK  data_split=$DATA_SPLIT  viz_split=$VIZ_SPLIT  suffix=${RUN_SUFFIX:-<none>}"
+echo "  ckpt     : $S2_CKPT"
 echo "  S1 seed  : $S1_SEED_CKPT"
 echo "  viz dir  : $VIZ_DIR"
-echo "  val data : data/$DATA_SPLIT/$TASK/train  (TRAINING episodes)"
+echo "  val data : $VIZ_DATA_DIR"
 echo "================================================================"
 nvidia-smi || true
 
@@ -106,13 +118,13 @@ apptainer exec --nv \
     export TOKENIZERS_PARALLELISM=false
     export WANDB_API_KEY=\$(cat ~/.secrets/wandb_api_key 2>/dev/null || echo '')
 
-    python main.py +name=${TASK}_stage_2${RUN_SUFFIX:+_$RUN_SUFFIX}_trainviz \
+    python main.py +name=${TASK}_stage_2${RUN_SUFFIX:+_$RUN_SUFFIX}_$VIZ_NAME \
       experiment.tasks=[validation] \
       algorithm=latent_world_model \
       experiment=exp_latent_dyn \
       dataset=real_aloha_dataset \
       dataset.dataset_dir=data/$DATA_SPLIT/$TASK \
-      dataset.val_dataset_dir=data/$DATA_SPLIT/$TASK/train \
+      dataset.val_dataset_dir=$VIZ_DATA_DIR \
       dataset.horizon=10 dataset.val_horizon=200 \
       dataset.obs_keys=$OBS_KEYS \
       dataset.action_mode=$ACT_MODE \
@@ -128,4 +140,4 @@ apptainer exec --nv \
       algorithm.training_stage=2 \
       load=$S2_CKPT
   "
-echo "[$(date)] Stage 2 train-set visualization finished"
+echo "[$(date)] Stage 2 $VIZ_SPLIT-set visualization finished"
