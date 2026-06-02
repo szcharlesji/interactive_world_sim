@@ -57,7 +57,8 @@ stage1:
   accumulate_grad_batches: 1
   val_batch_size: 8
   max_steps: 200005
-  checkpoint_every: 10000
+  checkpoint_every: 1000
+  checkpoint_save_top_k: -1  # keep every periodic checkpoint; can use lots of disk
   val_every: 6000
   log_every_n_steps: 100
   num_workers: 4
@@ -73,7 +74,8 @@ stage2:
   accumulate_grad_batches: 4
   val_batch_size: 1
   max_steps: 1000005
-  checkpoint_every: 10000
+  checkpoint_every: 1000
+  checkpoint_save_top_k: -1  # keep every periodic checkpoint; can use lots of disk
   val_every: 30000
   log_every_n_steps: 100
   num_workers: 4

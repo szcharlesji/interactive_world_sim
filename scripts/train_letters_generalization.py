@@ -424,6 +424,11 @@ def append_common_hydra_args(
             f"wandb.mode={wandb_mode}",
         ]
     )
+    if "checkpoint_save_top_k" in stage_cfg:
+        cmd.append(
+            "+experiment.training.checkpointing.save_top_k="
+            f"{int(stage_cfg['checkpoint_save_top_k'])}"
+        )
 
     for override in parse_tokens(run.get("extra_hydra_overrides", [])):
         cmd.append(override)
