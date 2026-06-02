@@ -225,5 +225,6 @@ python scripts/train_letters_generalization.py stage1 --run all_letters --gpus 1
 - Stage 1 uses `dataset=sim_aloha_dataset`, `dataset.obs_keys=[top_pov]`, `algorithm.action_dim=4`, `algorithm.training_stage=1`.
 - The script resumes from `<run_dir>/checkpoints/last.ckpt` by default if it exists. Pass `--resume 0` to ignore it.
 - `train_letters_generalization.py` is stage-separated: run `stage1` first, then run the desired `stage2` command after a stage-1 checkpoint exists.
+- HPC training uses separate sbatch scripts (`train_letters_stage1.sbatch`, `train_letters_stage2.sbatch`) following the same pattern as `train_all_stages.sbatch` / `train_stage2_only.sbatch`. Stage 2 training hyperparameters (batch_size=64, horizon=10, val_horizon=200, ...) match `train_stage2_only.sbatch`.
 - The generalization config saves periodic checkpoints every 1,000 training steps and keeps them (`checkpoint_save_top_k: -1`), in addition to `last.ckpt`. This can use significant disk for long runs.
 - Stage 2 snapshots the selected stage-1 checkpoint and `.hydra/` config into `<stage2_run_dir>/_s1_seed/` before training so `algorithm.load_ae` can resolve the correct autoencoder config.
