@@ -17,18 +17,19 @@
 # Downloads the procedural-letter sim dataset from HuggingFace, then trains
 # stage 1 only. Stage 2 is run separately with train_letters_stage2.sbatch.
 #
+# Dataset repos on HuggingFace:
+#   szcharlesji/push-letters-sim              all 26 letters, 90/10 split
+#   szcharlesji/push-letters-train20-val6     20 train + 6 heldout letters
+#
 # Usage:
 #   sbatch scripts/hpc/train_letters_stage1.sbatch <run>
 #
-#   run = all_letters          Baseline: S1 on all 26 letters
-#       | train20_val6         Heldout: S1 on 20 letters, val on 6 heldout
+#   run = all_letters          S1 on all 26 letters
+#       | train20_val6         S1 on 20 letters, val on 6 heldout
 #
 # Prereqs:
-#   - Dataset uploaded to HF: szcharlesji/push-letters-sim
-#     with subdirectories: all_letters_50/ and train20_val6_50/
 #   - $SCRATCH/iws.ext3 built (conda overlay with iws env)
 #   - ~/.secrets/wandb_api_key (chmod 600)
-#   - Repo cloned to /scratch/$USER/interactive_world_sim
 
 set -euo pipefail
 
@@ -37,14 +38,13 @@ RUN="${1:-all_letters}"
 REPO=/scratch/$USER/interactive_world_sim
 OVERLAY=$SCRATCH/iws.ext3
 IMAGE=${CONTAINER_IMAGES_FOLDER}/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif
-HF_DATASET_REPO="szcharlesji/push-letters-sim"
 
 case "$RUN" in
   all_letters)
-    DATASET_SUBDIR="all_letters_50"
+    HF_REPO="szcharlesji/push-letters-sim"
     ;;
   train20_val6)
-    DATASET_SUBDIR="train20_val6_50"
+    HF_REPO="szcharlesji/push-letters-train20-val6"
     ;;
   *)
     echo "ERROR: unknown run '$RUN'"
@@ -55,6 +55,7 @@ esac
 
 S1_DIR=$REPO/outputs/letters/$RUN/stage_1
 S1_DONE=$REPO/outputs/letters/$RUN/_stage1_done
+DATA_DIR="data/letters/$RUN"
 
 mkdir -p logs "$S1_DIR"
 
@@ -108,13 +109,11 @@ latest_ckpt() {
 # ============================================================
 # Download dataset
 # ============================================================
-DATA_DIR="data/letters/${DATASET_SUBDIR}"
 if [[ ! -d "$DATA_DIR/train" ]]; then
-  echo "[$(date)] Downloading $HF_DATASET_REPO/$DATASET_SUBDIR → $DATA_DIR"
+  echo "[$(date)] Downloading $HF_REPO → $DATA_DIR"
   python scripts/download_data_hf.py \
-    --repo "$HF_DATASET_REPO" \
-    --local_dir "$DATA_DIR" \
-    --repo_dir "$DATASET_SUBDIR"
+    --repo "$HF_REPO" \
+    --local_dir "$DATA_DIR"
 else
   echo "[$(date)] Dataset already downloaded: $DATA_DIR"
 fi

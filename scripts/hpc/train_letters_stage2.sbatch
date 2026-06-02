@@ -17,16 +17,21 @@
 # Runs independently of stage 1 — snapshots the latest S1 checkpoint at
 # job start. Safe to run in parallel with a still-going S1 job.
 #
+# Dataset repos on HuggingFace:
+#   szcharlesji/push-letters-sim              all 26 letters, 90/10 split
+#   szcharlesji/push-letters-train20-val6     20 train + 6 heldout letters
+#
 # Usage:
-#   sbatch scripts/hpc/train_letters_stage2.sbatch <run>
+#   sbatch scripts/hpc/train_letters_stage2.sbatch <run> [s1_ckpt]
 #
 #   run = all_letters          Baseline: S2 on all 26 letters
 #       | s1_all_s2_train20    Generalization: S1 all, S2 on 20 letters
 #       | s1_train20_s2_train20  Stronger test: S1+S2 both on 20 letters
 #
+#   s1_ckpt = optional explicit path to a stage-1 .ckpt file
+#
 # Prereqs:
 #   - Stage 1 checkpoint exists at outputs/letters/<s1_run>/stage_1/checkpoints/
-#   - Dataset uploaded to HF: szcharlesji/push-letters-sim
 #   - $SCRATCH/iws.ext3 built (conda overlay with iws env)
 #   - ~/.secrets/wandb_api_key (chmod 600)
 
@@ -37,20 +42,19 @@ RUN="${1:-all_letters}"
 REPO=/scratch/$USER/interactive_world_sim
 OVERLAY=$SCRATCH/iws.ext3
 IMAGE=${CONTAINER_IMAGES_FOLDER}/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif
-HF_DATASET_REPO="szcharlesji/push-letters-sim"
 
 case "$RUN" in
   all_letters)
     S1_RUN="all_letters"
-    DATASET_SUBDIR="all_letters_50"
+    HF_REPO="szcharlesji/push-letters-sim"
     ;;
   s1_all_s2_train20)
     S1_RUN="all_letters"
-    DATASET_SUBDIR="train20_val6_50"
+    HF_REPO="szcharlesji/push-letters-train20-val6"
     ;;
   s1_train20_s2_train20)
     S1_RUN="train20_val6"
-    DATASET_SUBDIR="train20_val6_50"
+    HF_REPO="szcharlesji/push-letters-train20-val6"
     ;;
   *)
     echo "ERROR: unknown run '$RUN'"
@@ -62,6 +66,13 @@ esac
 S1_DIR=$REPO/outputs/letters/$S1_RUN/stage_1
 S2_DIR=$REPO/outputs/letters/$RUN/stage_2
 S2_DONE=$REPO/outputs/letters/$RUN/_stage2_done
+
+# For s1_all_s2_train20, stage 2 uses a different dataset than stage 1
+if [[ "$RUN" == "s1_all_s2_train20" ]]; then
+  DATA_DIR="data/letters/train20_val6"
+else
+  DATA_DIR="data/letters/$S1_RUN"
+fi
 
 mkdir -p logs "$S2_DIR"
 
@@ -128,13 +139,11 @@ latest_ckpt() {
 # ============================================================
 # Download dataset for stage 2
 # ============================================================
-DATA_DIR="data/letters/${DATASET_SUBDIR}"
 if [[ ! -d "$DATA_DIR/train" ]]; then
-  echo "[$(date)] Downloading $HF_DATASET_REPO/$DATASET_SUBDIR → $DATA_DIR"
+  echo "[$(date)] Downloading $HF_REPO → $DATA_DIR"
   python scripts/download_data_hf.py \
-    --repo "$HF_DATASET_REPO" \
-    --local_dir "$DATA_DIR" \
-    --repo_dir "$DATASET_SUBDIR"
+    --repo "$HF_REPO" \
+    --local_dir "$DATA_DIR"
 else
   echo "[$(date)] Dataset already downloaded: $DATA_DIR"
 fi
