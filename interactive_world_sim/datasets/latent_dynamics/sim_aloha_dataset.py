@@ -354,6 +354,7 @@ class SimAlohaDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.dataset_dir = dataset_dir
+        self.val_dataset_dir = cfg.val_dataset_dir if "val_dataset_dir" in cfg else None
         self.skip_frame = cfg.skip_frame
         self.goal_sample = cfg.goal_sample
         self.use_cache = use_cache
@@ -406,7 +407,7 @@ class SimAlohaDataset(BaseImageDataset):
         """Return a validation dataset."""
         val_set = copy.copy(self)
         val_set.is_val = True
-        val_dir = os.path.join(self.dataset_dir, "val")
+        val_dir = self.val_dataset_dir or os.path.join(self.dataset_dir, "val")
         shape_meta = self.shape_meta
         use_cache = self.use_cache
         val_set.replay_buffer = load_replay_buffer(val_dir, use_cache, shape_meta)
@@ -557,7 +558,7 @@ def test_sim_aloha_dataset() -> None:
         _ = dataset[i]  # exercises __getitem__
         if (i + 1) % 50 == 0:
             gc.collect()
-            print(f"i={i+1} RSS={rss():.3f} GB")
+            print(f"i={i + 1} RSS={rss():.3f} GB")
 
     cpu_count = os.cpu_count()
     assert cpu_count is not None
@@ -575,7 +576,7 @@ def test_sim_aloha_dataset() -> None:
         i += 1
         if (i + 1) % 50 == 0:
             gc.collect()
-            print(f"i={i+1} RSS={rss():.3f} GB")
+            print(f"i={i + 1} RSS={rss():.3f} GB")
 
     val_dataset = dataset.get_validation_dataset()
     print(len(val_dataset))
